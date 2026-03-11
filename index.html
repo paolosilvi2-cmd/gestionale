@@ -1400,13 +1400,74 @@
             const error = document.getElementById('loginError');
             if (input.value === APP_PASSWORD) {
                 document.getElementById('loginScreen').style.display = 'none';
-                document.getElementById('startupScreen').style.display = 'flex';
+                // Controlla se ci sono dati salvati nel browser
+                if (autoLoad()) {
+                    document.getElementById('startupScreen').classList.add('hidden');
+                    initApp();
+                } else {
+                    document.getElementById('startupScreen').style.display = 'flex';
+                }
                 input.value = '';
                 error.style.display = 'none';
             } else {
                 error.style.display = 'block';
                 input.value = '';
                 input.focus();
+            }
+        }
+        
+        // =====================================
+        // AUTO-SAVE / AUTO-LOAD
+        // =====================================
+        const STORAGE_KEY = 'mediapizza_data';
+        
+        function autoSave() {
+            try {
+                const data = {
+                    catalog: CAT,
+                    images: IMG,
+                    clients: CLIENTS,
+                    warehouses: WAREHOUSES,
+                    orders: savedOrders,
+                    logo: LOGO_BASE64,
+                    inventory: INVENTORY,
+                    movements: MOVEMENTS,
+                    fifoStock: FIFO_STOCK,
+                    lastPriceChange: lastPriceChange,
+                    priceArchive: calcPriceArchive,
+                    saveDate: new Date().toISOString(),
+                    version: '3.1-v27-login'
+                };
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+            } catch(e) {
+                console.warn('AutoSave fallito:', e.message);
+            }
+        }
+        
+        function autoLoad() {
+            try {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (!saved) return false;
+                
+                const data = JSON.parse(saved);
+                if (!data.catalog || Object.keys(data.catalog).length === 0) return false;
+                
+                if (data.catalog) CAT = data.catalog;
+                if (data.images) IMG = data.images;
+                if (data.clients) CLIENTS = {...CLIENTS, ...data.clients};
+                if (data.warehouses) WAREHOUSES = {...WAREHOUSES, ...data.warehouses};
+                if (data.orders) savedOrders = data.orders;
+                if (data.logo) LOGO_BASE64 = data.logo;
+                if (data.inventory) INVENTORY = data.inventory;
+                if (data.movements) MOVEMENTS = data.movements;
+                if (data.fifoStock) FIFO_STOCK = data.fifoStock;
+                if (data.lastPriceChange !== undefined) lastPriceChange = data.lastPriceChange;
+                if (data.priceArchive) calcPriceArchive = data.priceArchive;
+                
+                return true;
+            } catch(e) {
+                console.warn('AutoLoad fallito:', e.message);
+                return false;
             }
         }
         
@@ -1519,11 +1580,13 @@
                     
                     document.getElementById('startupScreen').classList.add('hidden');
                     initApp();
+                    autoSave();
                     alert('✅ Dati caricati con successo!\n\n' + 
                           Object.keys(CAT).length + ' prodotti\n' +
                           Object.keys(CLIENTS).length + ' clienti\n' +
                           savedOrders.length + ' ordini\n' +
-                          calcPriceArchive.length + ' prezzi calcolati');
+                          calcPriceArchive.length + ' prezzi calcolati\n\n' +
+                          '💾 Dati salvati nel browser — al prossimo accesso li troverai già pronti!');
                     dataModified = false;
                 } catch(err) {
                     alert('❌ Errore nel file JSON: ' + err.message);
@@ -1745,7 +1808,7 @@
             }
             
             CLIENTS[newId] = { name, address };
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Reset form
             document.getElementById('newClientId').value = '';
@@ -1782,7 +1845,7 @@
             }
             
             CLIENTS[id] = { name, address };
-            dataModified = true;
+            dataModified = true; autoSave();
             
             document.getElementById('newClientId').value = '';
             document.getElementById('newClientName').value = '';
@@ -1800,7 +1863,7 @@
         function deleteClient(id) {
             if (!confirm(`Eliminare "${CLIENTS[id].name}"?`)) return;
             delete CLIENTS[id];
-            dataModified = true;
+            dataModified = true; autoSave();
             renderClientsList();
             renderClientRadios();
             initMagazzinoSelects(); // Aggiorna dropdown clienti in magazzino
@@ -2167,7 +2230,7 @@
                 };
             }
             
-            dataModified = true;
+            dataModified = true; autoSave();
             renderProductsList();
             renderArchive();
             
@@ -2251,7 +2314,7 @@
             
             // Reset lastPriceChange
             lastPriceChange = null;
-            dataModified = true;
+            dataModified = true; autoSave();
             renderProductsList();
             renderArchive();
             updateLastPriceChangeUI();
@@ -2287,7 +2350,7 @@
                 IMG[code] = imgPreview.dataset.base64;
             }
             
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Reset form
             document.getElementById('newProdCode').value = '';
@@ -2311,7 +2374,7 @@
             if (!confirm(`Eliminare "${code}"?`)) return;
             delete CAT[code];
             delete IMG[code];
-            dataModified = true;
+            dataModified = true; autoSave();
             renderProductsList();
             updateProductList();
             updateStatus();
@@ -2598,7 +2661,7 @@
             
             savedOrders.unshift(order);
             editingOriginalDate = null; // Reset dopo il salvataggio
-            dataModified = true;
+            dataModified = true; autoSave();
             
             currentOrder = [];
             updateOrderDisplay();
@@ -2725,7 +2788,7 @@
         function deleteOrder(index) {
             if (!confirm('Eliminare questo ordine?')) return;
             savedOrders.splice(index, 1);
-            dataModified = true;
+            dataModified = true; autoSave();
             renderArchive();
             updateStatus();
         }
@@ -2736,7 +2799,7 @@
             
             // Rimuovi dall'archivio
             savedOrders.splice(index, 1);
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Salva la data originale per ripristinarla al salvataggio
             editingOriginalDate = order.date;
@@ -3607,7 +3670,7 @@
                 MOVEMENTS.unshift(movementScarico);
             }
             
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Reset form
             caricoItems = [];
@@ -3836,7 +3899,7 @@
             };
             
             MOVEMENTS.unshift(movement);
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Reset form
             scaricoItems = [];
@@ -4009,7 +4072,7 @@
                 fifoAddLot(code, qty, prod.precio_compra, today, 'INIT-' + Date.now(), lotto);
             }
             
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Aggiorna UI
             if (document.getElementById('fifoDisplay').style.display !== 'none') {
@@ -4325,7 +4388,7 @@
             };
             
             MOVEMENTS.unshift(movement);
-            dataModified = true;
+            dataModified = true; autoSave();
             
             // Reset form
             allineamentoItems = [];
@@ -4386,7 +4449,7 @@
             
             // Rimuovi movimento
             MOVEMENTS.splice(movIndex, 1);
-            dataModified = true;
+            dataModified = true; autoSave();
             
             renderMovements();
             renderStock();
@@ -4629,7 +4692,7 @@
             renderCaricoItems();
             updateCaricoButton(false);
             updateStatus();
-            dataModified = true;
+            dataModified = true; autoSave();
             
             alert('✅ Carico modificato!');
             showMagSubpanelDirect('storico');
@@ -4698,7 +4761,7 @@
             renderScaricoItems();
             updateScaricoButton(false);
             updateStatus();
-            dataModified = true;
+            dataModified = true; autoSave();
             
             alert('✅ Consegna modificata!');
             showMagSubpanelDirect('storico');
@@ -4748,7 +4811,7 @@
             renderAllineamentoItems();
             updateAllineamentoButton(false);
             updateStatus();
-            dataModified = true;
+            dataModified = true; autoSave();
             
             alert('✅ Allineamento modificato!');
             showMagSubpanelDirect('storico');
@@ -5866,7 +5929,7 @@
                         }
                     });
                     
-                    dataModified = true;
+                    dataModified = true; autoSave();
                     renderProductsList();
                     updateProductList();
                     updateStatus();
@@ -5951,7 +6014,7 @@
                         }
                     });
                     
-                    dataModified = true;
+                    dataModified = true; autoSave();
                     renderClientsList();
                     renderClientRadios();
                     updateStatus();
