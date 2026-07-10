@@ -8,6 +8,501 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    
+    <!-- ============================================ -->
+    <!-- FIREBASE INTEGRATION (v34) - Warehouse sync   -->
+    <!-- Sync: orders, catalog, images, clients,       -->
+    <!--       warehouses + warehouse data (atomic)    -->
+    <!-- ============================================ -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-app.js";
+        import { 
+            getFirestore, collection, doc, setDoc, getDoc, deleteDoc, onSnapshot, 
+            getDocs, writeBatch, runTransaction
+        } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-firestore.js";
+        
+        const firebaseConfig = {
+            apiKey: "AIzaSyAMD177o8Se4a90oMFiWN9rBuGKULBG4e4",
+            authDomain: "mediapizza-gestione.firebaseapp.com",
+            projectId: "mediapizza-gestione",
+            storageBucket: "mediapizza-gestione.firebasestorage.app",
+            messagingSenderId: "532795705081",
+            appId: "1:532795705081:web:183e1a504a5c39fc164428"
+        };
+        
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const ordersCollection = collection(db, "orders");
+        const catalogCollection = collection(db, "catalog");
+        const clientsCollection = collection(db, "clients");
+        const warehousesCollection = collection(db, "warehouses");
+        const imagesCollection = collection(db, "images"); // v32: una immagine per documento
+        const warehouseDataDocRef = doc(db, "warehouseData", "main"); // v34: dati di magazzino (atomic)
+        const priceArchiveCollection = collection(db, "priceArchive"); // v37: prezzi calcolati
+        
+        // Espone le funzioni Firebase al resto del codice (non-module)
+        window.firebaseSync = {
+            ready: true,
+            
+            // Salva o aggiorna un ordine. Usa order.ref come ID documento.
+            // Se l'ordine esiste già con quel ref, viene sovrascritto (utile per "modifica").
+            saveOrder: async function(order) {
+                if (!order || !order.ref) {
+                    throw new Error("Ordine senza ref, impossibile salvare");
+                }
+                // Sostituisco "/" nel ref perché Firestore non lo accetta come ID
+                const docId = order.ref.replace(/\//g, '_');
+                await setDoc(doc(ordersCollection, docId), order);
+            },
+            
+            // Elimina un ordine dato il suo ref
+            deleteOrder: async function(orderRef) {
+                if (!orderRef) throw new Error("Ref mancante");
+                const docId = orderRef.replace(/\//g, '_');
+                await deleteDoc(doc(ordersCollection, docId));
+            },
+            
+            // Carica tutti gli ordini una volta sola (usato all'avvio)
+            loadAllOrders: async function() {
+                const snapshot = await getDocs(ordersCollection);
+                const orders = [];
+                snapshot.forEach(d => orders.push(d.data()));
+                // Ordina per data decrescente (i più recenti in cima)
+                orders.sort((a, b) => new Date(b.date) - new Date(a.date));
+                return orders;
+            },
+            
+            // Avvia il listener real-time. Chiama callback ogni volta che i dati cambiano.
+            startRealtimeListener: function(callback) {
+                return onSnapshot(ordersCollection, (snapshot) => {
+                    const orders = [];
+                    snapshot.forEach(d => orders.push(d.data()));
+                    orders.sort((a, b) => new Date(b.date) - new Date(a.date));
+                    callback(orders);
+                }, (error) => {
+                    console.error("Firebase listener error:", error);
+                    if (typeof window.onFirebaseError === 'function') {
+                        window.onFirebaseError(error);
+                    }
+                });
+            },
+            
+            // Carica un array di ordini su Firebase (usato dall'import JSON)
+            uploadBulk: async function(orders) {
+                let count = 0;
+                for (const order of orders) {
+                    if (order && order.ref) {
+                        const docId = order.ref.replace(/\//g, '_');
+                        await setDoc(doc(ordersCollection, docId), order);
+                        count++;
+                    }
+                }
+                return count;
+            },
+            
+            // Cancella TUTTI gli ordini dal cloud (Time Machine reset)
+            // Restituisce il numero di ordini cancellati
+            clearAllOrders: async function() {
+                const snapshot = await getDocs(ordersCollection);
+                let count = 0;
+                const deletePromises = [];
+                snapshot.forEach(d => {
+                    deletePromises.push(deleteDoc(d.ref));
+                    count++;
+                });
+                await Promise.all(deletePromises);
+                return count;
+            },
+            
+            // ==========================================================
+            // CATALOGO PRODOTTI (CAT)
+            // ==========================================================
+            // Carica tutti i prodotti del catalogo come oggetto { codice: prodotto }
+            loadCatalog: async function() {
+                const snapshot = await getDocs(catalogCollection);
+                const cat = {};
+                snapshot.forEach(d => { cat[d.id] = d.data(); });
+                return cat;
+            },
+            // Listener real-time per il catalogo
+            startCatalogListener: function(callback) {
+                return onSnapshot(catalogCollection, (snapshot) => {
+                    const cat = {};
+                    snapshot.forEach(d => { cat[d.id] = d.data(); });
+                    callback(cat);
+                });
+            },
+            // Salva un singolo prodotto
+            saveCatalogItem: async function(code, product) {
+                if (!code) throw new Error('Codice prodotto mancante');
+                // Sanitizzo l'ID per Firestore (no slash)
+                const docId = String(code).replace(/\//g, '_');
+                await setDoc(doc(catalogCollection, docId), product);
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            // Elimina un singolo prodotto
+            deleteCatalogItem: async function(code) {
+                const docId = String(code).replace(/\//g, '_');
+                await deleteDoc(doc(catalogCollection, docId));
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            // Carica intero catalogo in batch (sostituisce tutto quello che c'è)
+            uploadCatalogBulk: async function(catObj) {
+                let count = 0;
+                // Firestore batch supporta max 500 operazioni
+                const entries = Object.entries(catObj);
+                for (let i = 0; i < entries.length; i += 400) {
+                    const batch = writeBatch(db);
+                    const chunk = entries.slice(i, i + 400);
+                    for (const [code, product] of chunk) {
+                        const docId = String(code).replace(/\//g, '_');
+                        batch.set(doc(catalogCollection, docId), product);
+                        count++;
+                    }
+                    await batch.commit();
+                }
+                return count;
+            },
+            
+            // ==========================================================
+            // CLIENTI (CLIENTS)
+            // ==========================================================
+            loadClients: async function() {
+                const snapshot = await getDocs(clientsCollection);
+                const clients = {};
+                snapshot.forEach(d => { clients[d.id] = d.data(); });
+                return clients;
+            },
+            startClientsListener: function(callback) {
+                return onSnapshot(clientsCollection, (snapshot) => {
+                    const clients = {};
+                    snapshot.forEach(d => { clients[d.id] = d.data(); });
+                    callback(clients);
+                });
+            },
+            saveClient: async function(id, client) {
+                if (!id) throw new Error('ID cliente mancante');
+                const docId = String(id).replace(/\//g, '_');
+                await setDoc(doc(clientsCollection, docId), client);
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            deleteClient: async function(id) {
+                const docId = String(id).replace(/\//g, '_');
+                await deleteDoc(doc(clientsCollection, docId));
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            uploadClientsBulk: async function(clientsObj) {
+                const entries = Object.entries(clientsObj);
+                if (entries.length === 0) return 0;
+                const batch = writeBatch(db);
+                let count = 0;
+                for (const [id, client] of entries) {
+                    const docId = String(id).replace(/\//g, '_');
+                    batch.set(doc(clientsCollection, docId), client);
+                    count++;
+                }
+                await batch.commit();
+                return count;
+            },
+            
+            // ==========================================================
+            // MAGAZZINI (WAREHOUSES)
+            // ==========================================================
+            loadWarehouses: async function() {
+                const snapshot = await getDocs(warehousesCollection);
+                const warehouses = {};
+                snapshot.forEach(d => { warehouses[d.id] = d.data(); });
+                return warehouses;
+            },
+            startWarehousesListener: function(callback) {
+                return onSnapshot(warehousesCollection, (snapshot) => {
+                    const warehouses = {};
+                    snapshot.forEach(d => { warehouses[d.id] = d.data(); });
+                    callback(warehouses);
+                });
+            },
+            saveWarehouse: async function(id, warehouse) {
+                if (!id) throw new Error('ID magazzino mancante');
+                const docId = String(id).replace(/\//g, '_');
+                await setDoc(doc(warehousesCollection, docId), warehouse);
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            deleteWarehouse: async function(id) {
+                const docId = String(id).replace(/\//g, '_');
+                await deleteDoc(doc(warehousesCollection, docId));
+                if (window.markSyncedAfterWrite) window.markSyncedAfterWrite(); // v42
+            },
+            uploadWarehousesBulk: async function(warehousesObj) {
+                const entries = Object.entries(warehousesObj);
+                if (entries.length === 0) return 0;
+                const batch = writeBatch(db);
+                let count = 0;
+                for (const [id, wh] of entries) {
+                    const docId = String(id).replace(/\//g, '_');
+                    batch.set(doc(warehousesCollection, docId), wh);
+                    count++;
+                }
+                await batch.commit();
+                return count;
+            },
+            
+            // ==========================================================
+            // IMMAGINI (IMG) - v32: una immagine per documento
+            // Ogni immagine è un documento separato in collection "images"
+            // perché Firestore ha limite di 1MB per documento singolo.
+            // ==========================================================
+            loadImages: async function() {
+                const snapshot = await getDocs(imagesCollection);
+                const imgs = {};
+                snapshot.forEach(d => {
+                    const data = d.data();
+                    if (data && data.base64) imgs[d.id] = data.base64;
+                });
+                return imgs;
+            },
+            startImagesListener: function(callback) {
+                return onSnapshot(imagesCollection, (snapshot) => {
+                    const imgs = {};
+                    snapshot.forEach(d => {
+                        const data = d.data();
+                        if (data && data.base64) imgs[d.id] = data.base64;
+                    });
+                    callback(imgs);
+                });
+            },
+            // Salva una singola immagine (per aggiunta/modifica prodotto)
+            saveSingleImage: async function(code, base64) {
+                if (!code) throw new Error('Codice prodotto mancante');
+                const docId = String(code).replace(/\//g, '_');
+                await setDoc(doc(imagesCollection, docId), { base64: base64 || '' });
+            },
+            // Elimina una singola immagine
+            deleteSingleImage: async function(code) {
+                const docId = String(code).replace(/\//g, '_');
+                try {
+                    await deleteDoc(doc(imagesCollection, docId));
+                } catch (err) {
+                    // Se non esiste, va bene
+                }
+            },
+            // Carica TUTTE le immagini una per una (v33: sequenziale per evitare rate limit)
+            // Accetta un callback opzionale onProgress(current, total) per mostrare il progresso
+            // Restituisce { success: N, failed: N }
+            saveAllImages: async function(imgObj, onProgress) {
+                const stats = { success: 0, failed: 0 };
+                if (!imgObj || Object.keys(imgObj).length === 0) return stats;
+                const entries = Object.entries(imgObj);
+                const total = entries.length;
+                
+                for (let i = 0; i < entries.length; i++) {
+                    const [code, base64] = entries[i];
+                    const docId = String(code).replace(/\//g, '_');
+                    
+                    // Tentativo con retry interno: 3 tentativi prima di rinunciare
+                    let saved = false;
+                    for (let attempt = 0; attempt < 3 && !saved; attempt++) {
+                        try {
+                            await setDoc(doc(imagesCollection, docId), { base64: base64 || '' });
+                            saved = true;
+                            stats.success++;
+                        } catch (err) {
+                            if (attempt === 2) {
+                                // Ultimo tentativo fallito
+                                console.warn(`Immagine "${code}" non caricata dopo 3 tentativi:`, err.message);
+                                stats.failed++;
+                            } else {
+                                // Backoff progressivo: 500ms, poi 1500ms
+                                await new Promise(r => setTimeout(r, 500 * (attempt + 1) * 3));
+                            }
+                        }
+                    }
+                    
+                    // Pausa fra un'immagine e l'altra per non saturare Firebase
+                    // 100ms basta per stare nei limiti
+                    await new Promise(r => setTimeout(r, 100));
+                    
+                    // Callback progresso
+                    if (typeof onProgress === 'function') {
+                        try { onProgress(i + 1, total); } catch (e) {}
+                    }
+                }
+                
+                return stats;
+            },
+            
+            // ==========================================================
+            // WAREHOUSE DATA (v34): INVENTORY + MOVEMENTS + FIFO_STOCK
+            // Salvati come blob unico atomico per evitare disallineamenti.
+            // Il documento contiene { inventory, movements, fifoStock, _v }.
+            // _v è un numero di versione che cresce a ogni scrittura, usato
+            // per rilevare conflitti se due dispositivi scrivono insieme.
+            // ==========================================================
+            loadWarehouseData: async function() {
+                const snap = await getDoc(warehouseDataDocRef);
+                if (!snap.exists()) return null;
+                const d = snap.data();
+                return {
+                    inventory: d.inventory || {},
+                    movements: d.movements || [],
+                    fifoStock: d.fifoStock || {},
+                    _v: d._v || 0
+                };
+            },
+            startWarehouseDataListener: function(callback) {
+                return onSnapshot(warehouseDataDocRef, (snap) => {
+                    if (!snap.exists()) {
+                        callback(null);
+                        return;
+                    }
+                    const d = snap.data();
+                    callback({
+                        inventory: d.inventory || {},
+                        movements: d.movements || [],
+                        fifoStock: d.fifoStock || {},
+                        _updatedAt: d._updatedAt || null
+                    });
+                });
+            },
+            // v38: Salvataggio SEMPLICE con setDoc (no più transazioni).
+            // Restituisce { success: bool, error?: string }
+            saveWarehouseData: async function(newData) {
+                try {
+                    const stamp = new Date().toISOString() + '-' + Math.random().toString(36).slice(2, 8);
+                    const payload = {
+                        inventory: newData.inventory || {},
+                        movements: newData.movements || [],
+                        fifoStock: newData.fifoStock || {},
+                        _updatedAt: stamp
+                    };
+                    console.log('[WAREHOUSE SYNC] Tentativo scrittura su Firebase, movimenti:', payload.movements.length);
+                    await setDoc(warehouseDataDocRef, payload);
+                    console.log('[WAREHOUSE SYNC] ✅ Scrittura completata con successo');
+                    return { success: true, stamp: stamp };
+                } catch (err) {
+                    console.error('[WAREHOUSE SYNC] ❌ Errore scrittura:', err);
+                    return { success: false, error: err.message };
+                }
+            },
+            // Cancella i dati di magazzino dal cloud
+            clearWarehouseData: async function() {
+                try {
+                    await deleteDoc(warehouseDataDocRef);
+                    return true;
+                } catch (err) {
+                    return false;
+                }
+            },
+            
+            // ==========================================================
+            // PRICE ARCHIVE (v37): calcoli del calcolatore prezzi
+            // ==========================================================
+            loadPriceArchive: async function() {
+                const snapshot = await getDocs(priceArchiveCollection);
+                const items = [];
+                snapshot.forEach(d => items.push(d.data()));
+                // Ordina per data decrescente (più recenti in cima)
+                items.sort((a, b) => {
+                    const tA = a._createdAt || 0;
+                    const tB = b._createdAt || 0;
+                    return tB - tA;
+                });
+                return items;
+            },
+            startPriceArchiveListener: function(callback) {
+                return onSnapshot(priceArchiveCollection, (snapshot) => {
+                    const items = [];
+                    snapshot.forEach(d => items.push(d.data()));
+                    items.sort((a, b) => {
+                        const tA = a._createdAt || 0;
+                        const tB = b._createdAt || 0;
+                        return tB - tA;
+                    });
+                    callback(items);
+                });
+            },
+            savePriceItem: async function(item) {
+                if (!item || !item._id) throw new Error('Item senza _id, impossibile salvare');
+                const docId = String(item._id).replace(/\//g, '_');
+                await setDoc(doc(priceArchiveCollection, docId), item);
+            },
+            deletePriceItem: async function(itemId) {
+                if (!itemId) throw new Error('ID mancante');
+                const docId = String(itemId).replace(/\//g, '_');
+                await deleteDoc(doc(priceArchiveCollection, docId));
+            },
+            uploadPriceArchiveBulk: async function(items) {
+                if (!items || items.length === 0) return 0;
+                let count = 0;
+                // Batch da 400 (sicurezza sul limite Firestore di 500)
+                for (let i = 0; i < items.length; i += 400) {
+                    const batch = writeBatch(db);
+                    const chunk = items.slice(i, i + 400);
+                    for (const item of chunk) {
+                        // Genera _id se manca (per backward compatibility con vecchi JSON)
+                        if (!item._id) {
+                            item._id = 'price_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                        }
+                        if (!item._createdAt) item._createdAt = Date.now();
+                        const docId = String(item._id).replace(/\//g, '_');
+                        batch.set(doc(priceArchiveCollection, docId), item);
+                        count++;
+                    }
+                    await batch.commit();
+                }
+                return count;
+            },
+            clearAllPriceArchive: async function() {
+                const snapshot = await getDocs(priceArchiveCollection);
+                let count = 0;
+                const deletePromises = [];
+                snapshot.forEach(d => {
+                    deletePromises.push(deleteDoc(d.ref));
+                    count++;
+                });
+                await Promise.all(deletePromises);
+                return count;
+            },
+            
+            // Cancella TUTTI i dati cloud (Time Machine completo)
+            // Restituisce stats con i conteggi di quanto cancellato
+            clearAllCloudData: async function() {
+                const stats = { orders: 0, catalog: 0, clients: 0, warehouses: 0, images: 0, warehouseData: false, priceArchive: 0 };
+                
+                const collections = [
+                    { ref: ordersCollection, key: 'orders' },
+                    { ref: catalogCollection, key: 'catalog' },
+                    { ref: clientsCollection, key: 'clients' },
+                    { ref: warehousesCollection, key: 'warehouses' },
+                    { ref: imagesCollection, key: 'images' },
+                    { ref: priceArchiveCollection, key: 'priceArchive' }
+                ];
+                
+                for (const col of collections) {
+                    const snapshot = await getDocs(col.ref);
+                    const deletePromises = [];
+                    snapshot.forEach(d => {
+                        deletePromises.push(deleteDoc(d.ref));
+                        stats[col.key]++;
+                    });
+                    await Promise.all(deletePromises);
+                }
+                
+                // Cancella anche il documento singolo warehouseData
+                try {
+                    await deleteDoc(warehouseDataDocRef);
+                    stats.warehouseData = true;
+                } catch (err) {
+                    // Se non esiste, va bene così
+                }
+                
+                return stats;
+            }
+        };
+        
+        // Notifica al resto del codice che Firebase è pronto
+        window.dispatchEvent(new CustomEvent('firebaseReady'));
+    </script>
+    
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
@@ -115,6 +610,20 @@
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-dot.green { background: #28a745; }
         .status-dot.yellow { background: #ffc107; }
+        .status-dot.red { background: #dc3545; }
+        
+        /* Indicatore sincronizzazione Firebase */
+        .sync-indicator { display: flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .sync-indicator.synced { background: #28a745; color: white; }
+        .sync-indicator.syncing { background: #ffc107; color: #333; }
+        .sync-indicator.offline { background: #dc3545; color: white; }
+        .sync-indicator.connecting { background: #6c757d; color: white; }
+        .sync-indicator .sync-icon { display: inline-block; }
+        .sync-indicator.syncing .sync-icon { animation: syncSpin 1s linear infinite; }
+        @keyframes syncSpin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
         
         .delivery-box { background: #fff9e6; border: 2px solid #ffc107; padding: 15px; border-radius: 8px; margin-top: 15px; }
         .delivery-box h4 { color: #856404; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
@@ -142,12 +651,14 @@
         .subpanel { display: none; }
         .subpanel.active { display: block; }
         .stock-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 15px; }
-        .stock-card { background: white; border-radius: 10px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 4px solid #DC143C; }
+        .stock-card { background: white; border-radius: 10px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 4px solid #DC143C; transition: transform 0.15s, box-shadow 0.15s; }
+        .stock-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
         .stock-card h4 { color: #333; margin-bottom: 10px; font-size: 0.95em; }
         .stock-card .stock-qty { font-size: 1.8em; font-weight: bold; color: #DC143C; }
         .stock-card .stock-unit { color: #666; font-size: 0.85em; }
         .stock-card.low-stock { border-left-color: #ffc107; background: #fffbeb; }
-        .stock-card.out-of-stock { border-left-color: #dc3545; background: #fff5f5; }
+        .stock-card.out-of-stock { border-left-color: #6c757d; background: #f5f5f5; opacity: 0.85; }
+        .stock-card.out-of-stock .stock-qty { color: #6c757d; }
         .movement-item { display: flex; align-items: center; gap: 15px; padding: 15px; background: #f8f9fa; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid #28a745; }
         .movement-item.scarico { border-left-color: #dc3545; }
         .movement-item.allineamento { border-left-color: #17a2b8; background: #e3f2fd; }
@@ -241,10 +752,10 @@
         <p>Sistema Gestione Ordini</p>
         <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center;">
             <button class="btn" onclick="loadDataFile()">📂 Carica Dati (JSON)</button>
-            <button class="btn" style="background: #28a745; color: white;" onclick="startNewSession()">🆕 Nuova Sessione</button>
+            <button class="btn" style="background: #2196F3; color: white;" onclick="loadFromCloud()">☁️ Carica dal Cloud</button>
         </div>
         <input type="file" id="loadDataInput" accept=".json" style="display:none;" onchange="handleDataLoad(event)">
-        <p class="note">⚠️ Ricorda: i dati NON vengono salvati automaticamente.<br>Esporta sempre prima di chiudere!</p>
+        <p class="note">📂 Carica Dati: per importare catalogo, clienti, prodotti<br>☁️ Carica dal Cloud: per recuperare gli ordini sincronizzati</p>
     </div>
 
     <!-- Header principale -->
@@ -264,6 +775,12 @@
             <span id="clientCount">0 clienti</span> | 
             <span id="orderCount">0 ordini</span> |
             <span id="movementCount">0 movimenti</span>
+        </div>
+        <div class="status-item">
+            <span class="sync-indicator connecting" id="syncIndicator" title="Stato sincronizzazione cloud — clicca per forzare la riconnessione" style="cursor: pointer;" onclick="forceReconnectSync()">
+                <span class="sync-icon">⏳</span>
+                <span id="syncText">Connessione...</span>
+            </span>
         </div>
     </div>
     
@@ -334,9 +851,12 @@
                         <h2>📦 Aggiungi Prodotto</h2>
                         <div class="form-group">
                             <label>Prodotto</label>
-                            <select id="productSelect" onchange="showProductPreview()">
-                                <option value="">-- Seleziona prodotto --</option>
-                            </select>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <select id="productSelect" onchange="showProductPreview()" style="flex: 1;">
+                                    <option value="">-- Seleziona prodotto --</option>
+                                </select>
+                                <button type="button" class="btn btn-secondary btn-sm" id="orderShowAllBtn" onclick="toggleOrderShowAllProducts()" style="white-space: nowrap;">👁️ Mostra tutti i prodotti</button>
+                            </div>
                         </div>
                         
                         <div class="product-preview" id="productPreview" style="display:none;">
@@ -524,6 +1044,16 @@
                         </div>
                         <h3>📦 Aggiungi Prodotto</h3>
                         <div id="caricoFieldsNormal">
+                            <div class="form-group" style="margin-bottom: 10px;">
+                                <label style="font-size: 13px; color: #666;">Filtra prodotti per cliente:</label>
+                                <div style="display: flex; gap: 10px; margin-top: 5px; align-items: center;">
+                                    <select id="caricoNormalFilter" onchange="updateCaricoProductsNormal()" style="flex: 1;">
+                                        <option value="generico">Cliente Generico (MP)</option>
+                                        <!-- popolato dinamicamente -->
+                                    </select>
+                                    <button type="button" class="btn btn-secondary btn-sm" id="caricoNormalShowAllBtn" onclick="toggleCaricoNormalShowAll()" style="white-space: nowrap;">👁️ Mostra tutti</button>
+                                </div>
+                            </div>
                             <div class="grid-4">
                                 <div class="form-group">
                                     <label>Prodotto</label>
@@ -543,6 +1073,9 @@
                             </div>
                         </div>
                         <div id="caricoFieldsDiretto" style="display: none;">
+                            <div class="form-group" style="margin-bottom: 10px; display: flex; justify-content: flex-end;">
+                                <button type="button" class="btn btn-secondary btn-sm" id="caricoDirettoShowAllBtn" onclick="toggleCaricoDirettoShowAll()" style="white-space: nowrap;">👁️ Mostra tutti i prodotti</button>
+                            </div>
                             <div class="grid-3">
                                 <div class="form-group">
                                     <label>Prodotto</label>
@@ -607,6 +1140,9 @@
                             <input type="text" id="scaricoNote" placeholder="Note opzionali...">
                         </div>
                         <h3>📦 Aggiungi Prodotto</h3>
+                        <div class="form-group" style="margin-bottom: 10px; display: flex; justify-content: flex-end;">
+                            <button type="button" class="btn btn-secondary btn-sm" id="scaricoShowAllBtn" onclick="toggleScaricoShowAllProducts()" style="white-space: nowrap;">👁️ Mostra tutti i prodotti</button>
+                        </div>
                         <div class="grid-4">
                             <div class="form-group">
                                 <label>Prodotto</label>
@@ -698,6 +1234,7 @@
                         <button class="btn btn-secondary" onclick="renderStock()">🔄 Aggiorna</button>
                         <button class="btn btn-secondary" onclick="toggleFifoView()" id="fifoToggleBtn">🏷️ Mostra Lotti FIFO</button>
                         <button class="btn btn-warning" onclick="inizializzaFifoStockAttuale()" id="fifoInitBtn">🏗️ Inizializza FIFO stock attuale</button>
+                        <button class="btn btn-secondary" onclick="ricostruisciFifoUI()" id="fifoRebuildBtn" title="Ricalcola i lotti FIFO dai movimenti">🔧 Ricostruisci FIFO da movimenti</button>
                     </div>
                     <!-- Box Valore Totale Magazzino -->
                     <div id="stockValueTotal" style="background: linear-gradient(135deg, #1a5a1a, #2d8a2d); color: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.2);">
@@ -926,17 +1463,20 @@
                     </div>
                     <hr style="margin: 15px 0;">
                     <h3 style="margin-bottom: 15px;">➕ Nuovo Prodotto</h3>
-                    <div class="grid-2">
-                        <div class="form-group autocomplete-wrapper">
-                            <label>Codice Fornitore</label>
-                            <input type="text" id="newProdCode" placeholder="es: WFR01-33" oninput="filterProducts('code')" onfocus="filterProducts('code')">
-                            <div class="autocomplete-list" id="codeAutocomplete"></div>
+                    <div class="form-group autocomplete-wrapper">
+                        <label>Codice Fornitore</label>
+                        <input type="text" id="newProdCode" placeholder="es: WFR01-33" oninput="filterProducts('code')" onfocus="filterProducts('code')">
+                        <div class="autocomplete-list" id="codeAutocomplete"></div>
+                    </div>
+                    <!-- v41: gestione clienti associati al prodotto -->
+                    <div class="form-group">
+                        <label>Clienti associati (opzionale)</label>
+                        <div style="font-size: 12px; color: #888; margin-bottom: 8px;">
+                            Se non associ nessun cliente, il prodotto è considerato generico Media Pizza e visibile a tutti.
+                            Se lo associ a uno o più clienti, sarà visibile solo a loro.
                         </div>
-                        <div class="form-group autocomplete-wrapper">
-                            <label>Ref. DiMerca (opzionale)</label>
-                            <input type="text" id="newProdDimerca" placeholder="es: 6853" oninput="filterProducts('dimerca')" onfocus="filterProducts('dimerca')">
-                            <div class="autocomplete-list" id="dimercaAutocomplete"></div>
-                        </div>
+                        <div id="newProdClientRefs"><!-- popolato da renderNewProdClientRefs --></div>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="addNewProdClientRef()" style="margin-top: 5px;">+ Associa un cliente</button>
                     </div>
                     <div class="form-group autocomplete-wrapper">
                         <label>Descrizione</label>
@@ -1030,11 +1570,20 @@
                 </div>
             </div>
             
-            <div class="card">
-                <h2>🔄 Reset Completo</h2>
-                <p style="color: #666; margin-bottom: 15px;">Cancella tutti i dati. Azione irreversibile!</p>
-                <button class="btn btn-danger" onclick="resetAllData()">
-                    🗑️ Cancella Tutti i Dati
+            <div class="card" style="border: 2px solid #dc3545;">
+                <h2 style="color: #dc3545;">☁️ Svuota Cloud (Time Machine)</h2>
+                <p style="color: #666; margin-bottom: 10px;">
+                    Cancella TUTTI i dati dal cloud Firebase: ordini, catalogo, clienti, magazzini, immagini.
+                    Da usare prima di ricaricare un JSON vecchio per tornare a uno stato precedente.
+                </p>
+                <p style="color: #666; margin-bottom: 10px; font-size: 13px;">
+                    NOTA: l'inventario di magazzino, FIFO e movimenti restano sul tuo dispositivo (non sono ancora sincronizzati).
+                </p>
+                <p style="color: #dc3545; margin-bottom: 15px; font-weight: 600;">
+                    ⚠️ Azione irreversibile! Esporta sempre un backup JSON prima di procedere.
+                </p>
+                <button class="btn btn-danger" onclick="clearCloudOrders()">
+                    ☁️🗑️ Svuota Cloud
                 </button>
             </div>
         </div>
@@ -1375,7 +1924,6 @@
         let CAT = {};
         let IMG = {};
         let CLIENTS = {
-            dimerca: { name: 'DiMerca', address: 'Calle Atalaya 26, Urb. Ind. El Goro, 35219 Las Palmas' },
             altro: { name: 'Cliente Generico', address: '' }
         };
         let WAREHOUSES = {
@@ -1386,6 +1934,377 @@
         let currentOrder = [];
         let selectedClient = 'altro';
         let editingOriginalDate = null; // Preserva la data originale durante la modifica di un ordine
+        
+        // =====================================
+        // FIREBASE SYNC - Stato e helper (v31)
+        // =====================================
+        let firebaseListenerUnsubscribe = null; // Listener ordini
+        let firebaseCatalogUnsubscribe = null;
+        let firebaseClientsUnsubscribe = null;
+        let firebaseWarehousesUnsubscribe = null;
+        let firebaseImagesUnsubscribe = null;
+        let firebaseWarehouseDataUnsubscribe = null; // v34
+        let firebasePriceArchiveUnsubscribe = null; // v37
+        let firebaseInitialLoadDone = false; // True dopo il primo caricamento ordini
+        // Flag dei caricamenti per ogni collezione (per il "Carica dal Cloud")
+        let cloudInitialFlags = { orders: false, catalog: false, clients: false, warehouses: false, images: false, warehouseData: false, priceArchive: false };
+        // Versione corrente dei dati di magazzino sul cloud (per detection conflitti)
+        let warehouseDataVersion = 0;
+        // Flag per evitare loop: quando ricevo aggiornamenti dal cloud non devo riscrivere
+        // v43 (Bug 1 FIFO): invece di un flag "ignora il prossimo evento" (fragile,
+        // perché Firestore può generare più eventi per una scrittura), memorizziamo la
+        // FIRMA (_updatedAt) della nostra ultima scrittura. Il listener ignora QUALSIASI
+        // evento che riporti quella firma — non importa quanti ne arrivino.
+        let lastWarehouseWriteStamp = null;
+        
+        function setSyncStatus(status, customText) {
+            // status: 'synced' | 'syncing' | 'offline' | 'connecting'
+            const indicator = document.getElementById('syncIndicator');
+            const text = document.getElementById('syncText');
+            const icon = indicator?.querySelector('.sync-icon');
+            if (!indicator || !text) return;
+            
+            indicator.className = 'sync-indicator ' + status;
+            
+            const labels = {
+                connecting: { icon: '⏳', text: 'Connessione...' },
+                syncing: { icon: '🔄', text: 'Sincronizzazione...' },
+                synced: { icon: '✓', text: 'Sincronizzato' },
+                offline: { icon: '⚠', text: 'Offline' }
+            };
+            const conf = labels[status] || labels.connecting;
+            if (icon) icon.textContent = conf.icon;
+            text.textContent = customText || conf.text;
+        }
+        
+        // v42 (Bug D/E): rete di sicurezza dopo una scrittura.
+        // Dopo un salvataggio mettiamo l'indicatore giallo e contiamo sul listener
+        // real-time per rimetterlo verde. Se il listener tarda o non scatta (es. la
+        // scrittura non cambia nulla di osservabile), questo timer lo riporta verde
+        // dopo qualche secondo, così non resta bloccato in giallo.
+        let _syncedAfterWriteTimer = null;
+        function markSyncedAfterWrite(delayMs = 4000) {
+            if (_syncedAfterWriteTimer) clearTimeout(_syncedAfterWriteTimer);
+            _syncedAfterWriteTimer = setTimeout(() => {
+                // Solo se la sync iniziale era già completata (siamo operativi)
+                if (syncInitialComplete) {
+                    setSyncStatus('synced');
+                }
+            }, delayMs);
+        }
+        window.markSyncedAfterWrite = markSyncedAfterWrite; // v42: accessibile dal modulo Firebase
+        
+        // Helper: aggiorna UI quando un dato cambia da listener
+        function refreshUIAfterCloudUpdate(what) {
+            try {
+                if (what === 'orders' && typeof renderArchive === 'function') renderArchive();
+                if (what === 'catalog') {
+                    if (typeof renderProductsList === 'function') renderProductsList();
+                    if (typeof updateProductList === 'function') updateProductList();
+                    // v38b: aggiorna anche i selettori del magazzino (scarico/allineamento)
+                    if (typeof initMagazzinoSelects === 'function') initMagazzinoSelects();
+                    // v38b: aggiorna anche la lista prodotti della panoramica
+                    if (typeof initPanoramicaSelects === 'function') initPanoramicaSelects();
+                }
+                if (what === 'clients') {
+                    if (typeof renderClientsList === 'function') renderClientsList();
+                    if (typeof renderClientRadios === 'function') renderClientRadios();
+                    if (typeof initMagazzinoSelects === 'function') initMagazzinoSelects();
+                    if (typeof initChartClientSelect === 'function') initChartClientSelect();
+                    // v38b: aggiorna anche il selettore cliente della panoramica
+                    if (typeof initPanoramicaSelects === 'function') initPanoramicaSelects();
+                }
+                if (what === 'warehouses') {
+                    if (typeof updateWarehouseList === 'function') updateWarehouseList();
+                }
+                if (what === 'catalog' || what === 'images') {
+                    // Se le immagini cambiano, aggiorna anche la lista prodotti che le mostra
+                    if (typeof renderProductsList === 'function') renderProductsList();
+                }
+                // v38b: aggiorna sempre la panoramica con i dati nuovi
+                if (typeof updatePanoramica === 'function') {
+                    try { updatePanoramica(); } catch(e) {}
+                }
+                if (typeof updateStatus === 'function') updateStatus();
+            } catch (err) {
+                console.warn('refreshUIAfterCloudUpdate error:', err);
+            }
+        }
+        
+        // v42 (Bug D/E): traccia se la sync iniziale è completa e gestisce l'indicatore
+        // in modo robusto. Prima lo stato 'synced' dipendeva SOLO dal listener ordini:
+        // se non c'erano ordini sul cloud o il listener tardava, l'indicatore restava
+        // giallo per sempre anche se tutto il resto era sincronizzato.
+        let syncInitialComplete = false;
+        let syncSafetyTimer = null;
+        
+        function checkAllSynced() {
+            // I listener "critici" per dichiarare la sync completa.
+            // (images e priceArchive possono tardare senza bloccare l'indicatore)
+            const criticalDone = cloudInitialFlags.orders && cloudInitialFlags.catalog
+                && cloudInitialFlags.clients && cloudInitialFlags.warehouses
+                && cloudInitialFlags.warehouseData;
+            
+            if (criticalDone && !syncInitialComplete) {
+                syncInitialComplete = true;
+                setSyncStatus('synced');
+                if (syncSafetyTimer) { clearTimeout(syncSafetyTimer); syncSafetyTimer = null; }
+                console.log('[SYNC] Tutti i listener critici hanno completato il primo caricamento → SINCRONIZZATO');
+            } else if (syncInitialComplete) {
+                // Sync già completata in precedenza: un nuovo update dal cloud è arrivato,
+                // confermiamo lo stato verde (potrebbe essere stato messo a 'syncing' da una scrittura)
+                setSyncStatus('synced');
+            }
+        }
+        
+        // v42: forza la riconnessione riavviando tutti i listener (rete di sicurezza per l'utente)
+        function forceReconnectSync() {
+            console.log('[SYNC] Forzo riconnessione listener...');
+            setSyncStatus('syncing', 'Riconnessione...');
+            try {
+                // Disiscrivi i listener esistenti
+                if (typeof firebaseListenerUnsubscribe === 'function') firebaseListenerUnsubscribe();
+                if (typeof firebaseCatalogUnsubscribe === 'function') firebaseCatalogUnsubscribe();
+                if (typeof firebaseClientsUnsubscribe === 'function') firebaseClientsUnsubscribe();
+                if (typeof firebaseWarehousesUnsubscribe === 'function') firebaseWarehousesUnsubscribe();
+                if (typeof firebaseImagesUnsubscribe === 'function') firebaseImagesUnsubscribe();
+                if (typeof firebaseWarehouseDataUnsubscribe === 'function') firebaseWarehouseDataUnsubscribe();
+                if (typeof firebasePriceArchiveUnsubscribe === 'function') firebasePriceArchiveUnsubscribe();
+            } catch (e) {
+                console.warn('Errore disiscrizione listener:', e);
+            }
+            // Reset flag e riavvia
+            syncInitialComplete = false;
+            cloudInitialFlags = { orders: false, catalog: false, clients: false, warehouses: false, images: false, warehouseData: false, priceArchive: false };
+            startFirebaseSync();
+        }
+        
+        // Avvia tutti i listener real-time di Firebase
+        function startFirebaseSync() {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                console.warn('Firebase non pronto, riprovo tra 1 secondo...');
+                setSyncStatus('offline', 'Firebase non disponibile');
+                setTimeout(startFirebaseSync, 1000);
+                return;
+            }
+            
+            setSyncStatus('syncing', 'Caricamento dati cloud...');
+            
+            // v42: timer di sicurezza — se dopo 12s i listener critici non sono tutti
+            // arrivati, mostriamo comunque l'app come sincronizzata (i dati arriveranno
+            // appena la rete lo permette) per non lasciare l'indicatore bloccato in giallo.
+            if (syncSafetyTimer) clearTimeout(syncSafetyTimer);
+            syncSafetyTimer = setTimeout(() => {
+                if (!syncInitialComplete) {
+                    console.warn('[SYNC] Timeout di sicurezza: alcuni listener tardano, ma sblocco l\'indicatore.');
+                    syncInitialComplete = true;
+                    setSyncStatus('synced');
+                }
+            }, 12000);
+            
+            try {
+                // Listener ordini
+                firebaseListenerUnsubscribe = window.firebaseSync.startRealtimeListener((ordersFromCloud) => {
+                    savedOrders = ordersFromCloud;
+                    firebaseInitialLoadDone = true;
+                    cloudInitialFlags.orders = true;
+                    refreshUIAfterCloudUpdate('orders');
+                    checkAllSynced(); // v42
+                });
+                
+                // Listener catalogo
+                firebaseCatalogUnsubscribe = window.firebaseSync.startCatalogListener((catFromCloud) => {
+                    // Se il cloud è vuoto, non sovrascrivere il CAT locale (potrebbe essere appena caricato dal JSON)
+                    if (Object.keys(catFromCloud).length > 0 || cloudInitialFlags.catalog) {
+                        CAT = catFromCloud;
+                        migrateCatalogClientRefs(); // v41
+                    }
+                    cloudInitialFlags.catalog = true;
+                    refreshUIAfterCloudUpdate('catalog');
+                    checkAllSynced(); // v42
+                });
+                
+                // Listener clienti — gestione speciale per preservare i clienti di default
+                firebaseClientsUnsubscribe = window.firebaseSync.startClientsListener((clientsFromCloud) => {
+                    if (Object.keys(clientsFromCloud).length > 0 || cloudInitialFlags.clients) {
+                        // Mantiene sempre 'altro' (cliente generico) anche se non sul cloud
+                        CLIENTS = { altro: { name: 'Cliente Generico', address: '' }, ...clientsFromCloud };
+                    }
+                    cloudInitialFlags.clients = true;
+                    refreshUIAfterCloudUpdate('clients');
+                    checkAllSynced(); // v42
+                });
+                
+                // Listener magazzini
+                firebaseWarehousesUnsubscribe = window.firebaseSync.startWarehousesListener((whFromCloud) => {
+                    if (Object.keys(whFromCloud).length > 0 || cloudInitialFlags.warehouses) {
+                        WAREHOUSES = whFromCloud;
+                    }
+                    cloudInitialFlags.warehouses = true;
+                    refreshUIAfterCloudUpdate('warehouses');
+                    checkAllSynced(); // v42
+                });
+                
+                // Listener immagini
+                firebaseImagesUnsubscribe = window.firebaseSync.startImagesListener((imgFromCloud) => {
+                    if (Object.keys(imgFromCloud).length > 0 || cloudInitialFlags.images) {
+                        IMG = imgFromCloud;
+                    }
+                    cloudInitialFlags.images = true;
+                    refreshUIAfterCloudUpdate('images');
+                    checkAllSynced(); // v42
+                });
+                
+                // Listener warehouse data (v34): inventory + movements + fifoStock atomici
+                firebaseWarehouseDataUnsubscribe = window.firebaseSync.startWarehouseDataListener((whData) => {
+                    cloudInitialFlags.warehouseData = true;
+                    checkAllSynced(); // v42 (chiamato qui per coprire tutti i percorsi di return sotto)
+                    
+                    if (whData === null) {
+                        // Documento non esiste su cloud (primo avvio o dopo svuotamento)
+                        // v38: pulisci anche i dati locali
+                        INVENTORY = {};
+                        MOVEMENTS = [];
+                        FIFO_STOCK = {};
+                        try {
+                            if (typeof renderMovements === 'function') renderMovements();
+                            if (typeof renderStock === 'function') renderStock();
+                            if (typeof updateCharts === 'function') updateCharts();
+                            if (typeof updateStatus === 'function') updateStatus();
+                        } catch (err) {}
+                        return;
+                    }
+                    
+                    // v43 (Bug 1 FIFO): se questo evento riporta la firma della NOSTRA
+                    // ultima scrittura, è la nostra modifica che torna indietro: ignoralo.
+                    // Funziona anche con eventi multipli generati dalla stessa scrittura.
+                    if (whData._updatedAt && whData._updatedAt === lastWarehouseWriteStamp) {
+                        return;
+                    }
+                    
+                    // Aggiorna i dati locali con quelli dal cloud
+                    INVENTORY = whData.inventory;
+                    MOVEMENTS = whData.movements;
+                    FIFO_STOCK = whData.fifoStock;
+                    
+                    try {
+                        if (typeof renderMovements === 'function') renderMovements();
+                        if (typeof renderStock === 'function') renderStock();
+                        if (typeof updateCharts === 'function') updateCharts();
+                        if (typeof updateStatus === 'function') updateStatus();
+                        // v38b: aggiorna anche la panoramica vendite
+                        if (typeof updatePanoramica === 'function') updatePanoramica();
+                    } catch (err) {
+                        console.warn('Errore refresh UI dopo warehouseData update:', err);
+                    }
+                });
+                
+                // v37: Listener priceArchive (calcoli prezzi)
+                firebasePriceArchiveUnsubscribe = window.firebaseSync.startPriceArchiveListener((itemsFromCloud) => {
+                    if (itemsFromCloud.length > 0 || cloudInitialFlags.priceArchive) {
+                        calcPriceArchive = itemsFromCloud;
+                        // Aggiorna anche localStorage come "cache offline"
+                        try {
+                            localStorage.setItem('mediaPizzaPriceArchive', JSON.stringify(calcPriceArchive));
+                        } catch (e) {}
+                    }
+                    cloudInitialFlags.priceArchive = true;
+                    // Aggiorna UI se la funzione esiste già
+                    try {
+                        if (typeof calcLoadArchive === 'function') calcLoadArchive();
+                        if (typeof updateStatus === 'function') updateStatus();
+                    } catch (err) {
+                        console.warn('Errore refresh UI dopo priceArchive update:', err);
+                    }
+                    checkAllSynced(); // v42
+                });
+            } catch (err) {
+                console.error('Errore avvio Firebase sync:', err);
+                setSyncStatus('offline', 'Errore: ' + err.message);
+            }
+        }
+        
+        // Gestione errori Firebase (chiamata da firebaseSync se il listener fallisce)
+        window.onFirebaseError = function(error) {
+            console.error('Firebase error:', error);
+            setSyncStatus('offline', 'Errore di connessione');
+        };
+        
+        // Salva un ordine su Firebase (con feedback visivo)
+        async function syncOrderToFirebase(order) {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                throw new Error('Firebase non disponibile');
+            }
+            setSyncStatus('syncing', 'Salvataggio...');
+            try {
+                await window.firebaseSync.saveOrder(order);
+                // Lo stato 'synced' verrà ripristinato dal listener real-time
+                markSyncedAfterWrite(); // v42: rete di sicurezza se il listener tarda
+            } catch (err) {
+                setSyncStatus('offline', 'Errore salvataggio');
+                throw err;
+            }
+        }
+        
+        // Elimina un ordine da Firebase
+        async function syncDeleteFromFirebase(orderRef) {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                throw new Error('Firebase non disponibile');
+            }
+            setSyncStatus('syncing', 'Eliminazione...');
+            try {
+                await window.firebaseSync.deleteOrder(orderRef);
+                markSyncedAfterWrite(); // v42
+            } catch (err) {
+                setSyncStatus('offline', 'Errore eliminazione');
+                throw err;
+            }
+        }
+        
+        // v38: Sincronizza il magazzino sul cloud con setDoc semplice
+        async function syncWarehouseToCloud() {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                console.warn('[WAREHOUSE] Firebase non disponibile, magazzino salvato solo in locale');
+                alert('⚠️ Firebase non disponibile. Le modifiche al magazzino sono salvate solo in locale e NON sincronizzate con altri dispositivi.');
+                return false;
+            }
+            
+            setSyncStatus('syncing', 'Salvataggio magazzino...');
+            
+            const dataToSave = {
+                inventory: INVENTORY,
+                movements: MOVEMENTS,
+                fifoStock: FIFO_STOCK
+            };
+            
+            const result = await window.firebaseSync.saveWarehouseData(dataToSave);
+            
+            if (result.success) {
+                // v43: memorizza la firma così il listener ignora gli eventi-eco di questa scrittura
+                lastWarehouseWriteStamp = result.stamp;
+                setSyncStatus('synced');
+                // v38b: aggiorna la panoramica per riflettere i nuovi dati
+                try {
+                    if (typeof updatePanoramica === 'function') updatePanoramica();
+                } catch(e) {}
+                return true;
+            }
+            
+            setSyncStatus('offline', 'Errore salvataggio magazzino');
+            alert('❌ ERRORE salvataggio magazzino sul cloud:\n\n' + (result.error || 'sconosciuto') + '\n\nLe modifiche sono salvate in locale ma NON sincronizzate. Controlla la console per dettagli.');
+            return false;
+        }
+        
+        // Avvia Firebase quando il modulo è pronto
+        if (window.firebaseSync && window.firebaseSync.ready) {
+            // Già pronto (caricamento veloce)
+            // Non avviamo subito: aspettiamo dopo il login per evitare carichi inutili
+        } else {
+            window.addEventListener('firebaseReady', () => {
+                console.log('Firebase modulo pronto');
+            });
+        }
+        // FINE FIREBASE SYNC
         
         // Dati Calcolatore Prezzi
         let calcCurrentCalculation = null;
@@ -1400,74 +2319,16 @@
             const error = document.getElementById('loginError');
             if (input.value === APP_PASSWORD) {
                 document.getElementById('loginScreen').style.display = 'none';
-                // Controlla se ci sono dati salvati nel browser
-                if (autoLoad()) {
-                    document.getElementById('startupScreen').classList.add('hidden');
-                    initApp();
-                } else {
-                    document.getElementById('startupScreen').style.display = 'flex';
-                }
+                document.getElementById('startupScreen').style.display = 'flex';
                 input.value = '';
                 error.style.display = 'none';
+                
+                // Avvia sincronizzazione Firebase dopo il login
+                startFirebaseSync();
             } else {
                 error.style.display = 'block';
                 input.value = '';
                 input.focus();
-            }
-        }
-        
-        // =====================================
-        // AUTO-SAVE / AUTO-LOAD
-        // =====================================
-        const STORAGE_KEY = 'mediapizza_data';
-        
-        function autoSave() {
-            try {
-                const data = {
-                    catalog: CAT,
-                    images: IMG,
-                    clients: CLIENTS,
-                    warehouses: WAREHOUSES,
-                    orders: savedOrders,
-                    logo: LOGO_BASE64,
-                    inventory: INVENTORY,
-                    movements: MOVEMENTS,
-                    fifoStock: FIFO_STOCK,
-                    lastPriceChange: lastPriceChange,
-                    priceArchive: calcPriceArchive,
-                    saveDate: new Date().toISOString(),
-                    version: '3.1-v27-login'
-                };
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-            } catch(e) {
-                console.warn('AutoSave fallito:', e.message);
-            }
-        }
-        
-        function autoLoad() {
-            try {
-                const saved = localStorage.getItem(STORAGE_KEY);
-                if (!saved) return false;
-                
-                const data = JSON.parse(saved);
-                if (!data.catalog || Object.keys(data.catalog).length === 0) return false;
-                
-                if (data.catalog) CAT = data.catalog;
-                if (data.images) IMG = data.images;
-                if (data.clients) CLIENTS = {...CLIENTS, ...data.clients};
-                if (data.warehouses) WAREHOUSES = {...WAREHOUSES, ...data.warehouses};
-                if (data.orders) savedOrders = data.orders;
-                if (data.logo) LOGO_BASE64 = data.logo;
-                if (data.inventory) INVENTORY = data.inventory;
-                if (data.movements) MOVEMENTS = data.movements;
-                if (data.fifoStock) FIFO_STOCK = data.fifoStock;
-                if (data.lastPriceChange !== undefined) lastPriceChange = data.lastPriceChange;
-                if (data.priceArchive) calcPriceArchive = data.priceArchive;
-                
-                return true;
-            } catch(e) {
-                console.warn('AutoLoad fallito:', e.message);
-                return false;
             }
         }
         
@@ -1549,6 +2410,55 @@
             initApp();
         }
         
+        // v29+: carica direttamente dal cloud Firebase senza passare dal JSON
+        async function loadFromCloud() {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                alert('⚠️ Firebase non è ancora pronto. Aspetta qualche secondo e riprova.\n\nSe il problema persiste, controlla la connessione internet.');
+                return;
+            }
+            
+            setSyncStatus('syncing', 'Caricamento dal cloud...');
+            
+            // Aspetto che TUTTI i listener iniziali abbiano caricato (max 15 secondi)
+            let waitMs = 0;
+            while (waitMs < 15000) {
+                const allDone = cloudInitialFlags.orders && cloudInitialFlags.catalog 
+                    && cloudInitialFlags.clients && cloudInitialFlags.warehouses 
+                    && cloudInitialFlags.images && cloudInitialFlags.warehouseData
+                    && cloudInitialFlags.priceArchive;
+                if (allDone) break;
+                await new Promise(r => setTimeout(r, 200));
+                waitMs += 200;
+            }
+            
+            const allDone = cloudInitialFlags.orders && cloudInitialFlags.catalog 
+                && cloudInitialFlags.clients && cloudInitialFlags.warehouses 
+                && cloudInitialFlags.images && cloudInitialFlags.warehouseData
+                && cloudInitialFlags.priceArchive;
+            
+            if (!allDone) {
+                alert('⚠️ Caricamento dal cloud più lento del previsto. Alcuni dati potrebbero mancare. Controlla la connessione.');
+                setSyncStatus('offline', 'Timeout caricamento');
+                // Procediamo lo stesso con quello che è arrivato
+            }
+            
+            document.getElementById('startupScreen').classList.add('hidden');
+            initApp();
+            
+            const nProd = Object.keys(CAT).length;
+            const nCli = Object.keys(CLIENTS).filter(k => k !== 'altro').length;
+            const nWh = Object.keys(WAREHOUSES).length;
+            const nOrd = savedOrders.length;
+            const nMov = MOVEMENTS.length;
+            const nPrice = calcPriceArchive.length;
+            
+            if (nProd === 0 && nCli === 0 && nWh === 0 && nOrd === 0 && nMov === 0 && nPrice === 0) {
+                alert(`ℹ️ Il cloud è vuoto.\n\nPuoi importare un file JSON per popolare i dati.`);
+            } else {
+                alert(`✅ Caricati dal cloud:\n\n${nProd} prodotti\n${nCli} clienti\n${nWh} magazzini\n${nOrd} ordini\n${nMov} movimenti di magazzino\n${nPrice} prezzi calcolati`);
+            }
+        }
+        
         function loadDataFile() {
             document.getElementById('loadDataInput').click();
         }
@@ -1558,15 +2468,18 @@
             if (!file) return;
             
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const data = JSON.parse(e.target.result);
                     
-                    if (data.catalog) CAT = data.catalog;
+                    if (data.catalog) {
+                        CAT = data.catalog;
+                        migrateCatalogClientRefs(); // v41
+                    }
                     if (data.images) IMG = data.images;
                     if (data.clients) CLIENTS = {...CLIENTS, ...data.clients};
                     if (data.warehouses) WAREHOUSES = {...WAREHOUSES, ...data.warehouses};
-                    if (data.orders) savedOrders = data.orders;
+                    // NOTA v28+: ordini, catalogo, immagini, clienti, magazzini vanno su Firebase
                     if (data.logo) LOGO_BASE64 = data.logo;
                     if (data.inventory) INVENTORY = data.inventory;
                     if (data.movements) MOVEMENTS = data.movements;
@@ -1578,15 +2491,106 @@
                         calcLoadArchive();
                     }
                     
+                    // v31: caricamento automatico su Firebase di TUTTI i dati supportati
+                    let uploadStats = { orders: 0, catalog: 0, clients: 0, warehouses: 0, images: 0, imagesFailed: 0, warehouseData: false, priceArchive: 0 };
+                    
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        setSyncStatus('syncing', 'Caricamento dati sul cloud...');
+                        try {
+                            // Catalogo
+                            if (data.catalog && Object.keys(data.catalog).length > 0) {
+                                uploadStats.catalog = await window.firebaseSync.uploadCatalogBulk(data.catalog);
+                            }
+                            // Clienti (escludo 'altro' che è il cliente generico hardcoded)
+                            if (data.clients) {
+                                const clientsToUpload = {...data.clients};
+                                delete clientsToUpload.altro;
+                                if (Object.keys(clientsToUpload).length > 0) {
+                                    uploadStats.clients = await window.firebaseSync.uploadClientsBulk(clientsToUpload);
+                                }
+                            }
+                            // Magazzini
+                            if (data.warehouses && Object.keys(data.warehouses).length > 0) {
+                                uploadStats.warehouses = await window.firebaseSync.uploadWarehousesBulk(data.warehouses);
+                            }
+                            // Immagini (v33: una per documento, sequenziali con progress)
+                            if (data.images && Object.keys(data.images).length > 0) {
+                                const totalImg = Object.keys(data.images).length;
+                                const imgStats = await window.firebaseSync.saveAllImages(
+                                    data.images,
+                                    (current, total) => {
+                                        setSyncStatus('syncing', `Immagini ${current}/${total}...`);
+                                    }
+                                );
+                                uploadStats.images = imgStats.success;
+                                uploadStats.imagesFailed = imgStats.failed;
+                            }
+                            // Ordini
+                            if (data.orders && Array.isArray(data.orders) && data.orders.length > 0) {
+                                uploadStats.orders = await window.firebaseSync.uploadBulk(data.orders);
+                            }
+                            // v38: dati magazzino come blob unico (no più versioning)
+                            if (data.inventory || data.movements || data.fifoStock) {
+                                setSyncStatus('syncing', 'Salvataggio magazzino sul cloud...');
+                                const whResult = await window.firebaseSync.saveWarehouseData({
+                                    inventory: INVENTORY || {},
+                                    movements: MOVEMENTS || [],
+                                    fifoStock: FIFO_STOCK || {}
+                                });
+                                if (whResult.success) {
+                                    lastWarehouseWriteStamp = whResult.stamp; // v43
+                                    uploadStats.warehouseData = true;
+                                } else {
+                                    console.error('Errore upload warehouseData:', whResult);
+                                    alert('⚠️ Errore caricamento magazzino sul cloud: ' + (whResult.error || 'sconosciuto'));
+                                }
+                            }
+                            // v37: dati priceArchive (calcoli prezzi)
+                            if (data.priceArchive && Array.isArray(data.priceArchive) && data.priceArchive.length > 0) {
+                                setSyncStatus('syncing', 'Salvataggio prezzi sul cloud...');
+                                try {
+                                    uploadStats.priceArchive = await window.firebaseSync.uploadPriceArchiveBulk(data.priceArchive);
+                                } catch (err) {
+                                    console.warn('Errore upload priceArchive:', err);
+                                }
+                            }
+                            setSyncStatus('synced');
+                        } catch (err) {
+                            alert('⚠️ Errore durante il caricamento sul cloud: ' + err.message + '\n\nAlcuni dati potrebbero non essere stati sincronizzati.');
+                            setSyncStatus('offline', 'Errore caricamento');
+                        }
+                    } else {
+                        // Firebase non disponibile: fallback locale
+                        if (data.orders) savedOrders = data.orders;
+                        alert('⚠️ Firebase non disponibile: dati caricati solo in memoria locale.');
+                    }
+                    
                     document.getElementById('startupScreen').classList.add('hidden');
                     initApp();
-                    autoSave();
-                    alert('✅ Dati caricati con successo!\n\n' + 
-                          Object.keys(CAT).length + ' prodotti\n' +
-                          Object.keys(CLIENTS).length + ' clienti\n' +
-                          savedOrders.length + ' ordini\n' +
-                          calcPriceArchive.length + ' prezzi calcolati\n\n' +
-                          '💾 Dati salvati nel browser — al prossimo accesso li troverai già pronti!');
+                    
+                    let summary = '✅ Dati caricati con successo!\n\n';
+                    summary += Object.keys(CAT).length + ' prodotti\n';
+                    summary += Object.keys(CLIENTS).length + ' clienti\n';
+                    summary += Object.keys(WAREHOUSES).length + ' magazzini\n';
+                    summary += savedOrders.length + ' ordini\n';
+                    summary += MOVEMENTS.length + ' movimenti di magazzino\n';
+                    summary += calcPriceArchive.length + ' prezzi calcolati\n';
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        summary += '\n☁️ Sincronizzato sul cloud:\n';
+                        summary += `${uploadStats.catalog} prodotti, ${uploadStats.clients} clienti, ${uploadStats.warehouses} magazzini, ${uploadStats.orders} ordini, ${uploadStats.images} immagini`;
+                        if (uploadStats.warehouseData) {
+                            summary += `\n${MOVEMENTS.length} movimenti di magazzino sincronizzati ✓`;
+                        } else if (data.inventory || data.movements || data.fifoStock) {
+                            summary += `\n\n⚠️ I dati di magazzino NON sono stati sincronizzati sul cloud. Riprova l'importazione o controlla la connessione.`;
+                        }
+                        if (uploadStats.priceArchive > 0) {
+                            summary += `\n${uploadStats.priceArchive} prezzi calcolati sincronizzati ✓`;
+                        }
+                        if (uploadStats.imagesFailed > 0) {
+                            summary += `\n\n⚠️ ATTENZIONE: ${uploadStats.imagesFailed} immagini NON sono state caricate (timeout o errore Firebase). Riprova ad importare il JSON o ricarica le immagini singolarmente.`;
+                        }
+                    }
+                    alert(summary);
                     dataModified = false;
                 } catch(err) {
                     alert('❌ Errore nel file JSON: ' + err.message);
@@ -1614,7 +2618,7 @@
                 lastPriceChange: lastPriceChange,
                 priceArchive: calcPriceArchive,
                 exportDate: new Date().toISOString(),
-                version: '3.1-v27-login'
+                version: '5.3-v47-toggle-evaso-manuale'
             };
             
             const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
@@ -1631,16 +2635,16 @@
         }
         
         function resetAllData() {
-            if (!confirm('⚠️ Cancellare TUTTI i dati?')) return;
+            if (!confirm('⚠️ Cancellare TUTTI i dati locali?\n\nNOTA: gli ordini sul cloud (Firebase) NON verranno eliminati. Per cancellarli, eliminali uno per uno dall\'archivio oppure dalla console Firebase.')) return;
             if (!confirm('🔴 ULTIMA CONFERMA - Sei sicuro?')) return;
             
             CAT = {};
             IMG = {};
             CLIENTS = {
-                dimerca: { name: 'DiMerca', address: 'Calle Atalaya 26, Urb. Ind. El Goro, 35219 Las Palmas' },
                 altro: { name: 'Cliente Generico', address: '' }
             };
-            savedOrders = [];
+            // NOTA v28: non resetto savedOrders perché viene gestito dal listener Firebase.
+            // Il reset locale lascia gli ordini su cloud intatti.
             currentOrder = [];
             calcPriceArchive = [];
             FIFO_STOCK = {};
@@ -1648,7 +2652,79 @@
             calcLoadArchive();
             
             initApp();
-            alert('✅ Dati cancellati.');
+            alert('✅ Dati locali cancellati.\n\nGli ordini sul cloud sono ancora presenti e verranno ricaricati automaticamente.');
+        }
+        
+        // v31: Svuota TUTTO dal cloud Firebase (Time Machine completo)
+        async function clearCloudOrders() {
+            if (!window.firebaseSync || !window.firebaseSync.ready) {
+                alert('⚠️ Firebase non è disponibile. Riprova tra qualche secondo.');
+                return;
+            }
+            
+            const totalItems = savedOrders.length + Object.keys(CAT).length 
+                + Object.keys(CLIENTS).filter(k => k !== 'altro').length 
+                + Object.keys(WAREHOUSES).length
+                + MOVEMENTS.length
+                + calcPriceArchive.length;
+            
+            if (totalItems === 0) {
+                alert('ℹ️ Il cloud è già vuoto. Non c\'è nulla da cancellare.');
+                return;
+            }
+            
+            // Prima conferma
+            if (!confirm(
+                `⚠️ ATTENZIONE: stai per cancellare TUTTI i dati dal cloud Firebase:\n\n` +
+                `• ${savedOrders.length} ordini\n` +
+                `• ${Object.keys(CAT).length} prodotti del catalogo\n` +
+                `• ${Object.keys(CLIENTS).filter(k => k !== 'altro').length} clienti\n` +
+                `• ${Object.keys(WAREHOUSES).length} magazzini\n` +
+                `• Tutte le immagini\n` +
+                `• ${MOVEMENTS.length} movimenti di magazzino (inventario, FIFO, carichi/scarichi)\n` +
+                `• ${calcPriceArchive.length} prezzi calcolati\n\n` +
+                `Questa operazione è IRREVERSIBILE.\n\n` +
+                `Hai esportato un backup JSON di sicurezza?\n\n` +
+                `Premi OK solo se sei davvero sicuro di voler procedere.`
+            )) return;
+            
+            // Seconda conferma con parola chiave
+            const userInput = prompt(
+                `🔴 ULTIMA CONFERMA\n\n` +
+                `Per procedere alla cancellazione di tutti i dati dal cloud, ` +
+                `digita la parola CANCELLA (in maiuscolo) qui sotto:`
+            );
+            
+            if (userInput === null) return;
+            
+            if (userInput.trim() !== 'CANCELLA') {
+                alert('❌ Parola di conferma errata. Operazione annullata.');
+                return;
+            }
+            
+            // Procedo con la cancellazione
+            setSyncStatus('syncing', 'Svuotamento cloud...');
+            
+            try {
+                const stats = await window.firebaseSync.clearAllCloudData();
+                // I listener real-time aggiorneranno automaticamente CAT/CLIENTS/WAREHOUSES/IMG/savedOrders/calcPriceArchive
+                let msg = `✅ Cloud svuotato:\n\n`;
+                msg += `• ${stats.orders} ordini cancellati\n`;
+                msg += `• ${stats.catalog} prodotti cancellati\n`;
+                msg += `• ${stats.clients} clienti cancellati\n`;
+                msg += `• ${stats.warehouses} magazzini cancellati\n`;
+                msg += `• ${stats.images} immagini cancellate\n`;
+                if (stats.warehouseData) {
+                    msg += `• Dati di magazzino cancellati\n`;
+                }
+                msg += `• ${stats.priceArchive} prezzi calcolati cancellati\n`;
+                msg += `\nOra puoi caricare un JSON vecchio per ripristinare uno stato precedente, oppure ripartire da zero.`;
+                alert(msg);
+            } catch (err) {
+                console.error('Errore svuotamento cloud:', err);
+                alert('❌ Errore durante lo svuotamento del cloud:\n' + err.message + '\n\nAlcuni dati potrebbero essere stati cancellati e altri no.');
+                setSyncStatus('offline', 'Errore svuotamento');
+            }
         }
         
         // =====================================
@@ -1737,6 +2813,16 @@
         
         function selectClient(id) {
             selectedClient = id;
+            // v41: reset del toggle "Mostra tutti" al cambio cliente
+            if (window._orderShowAllProducts) {
+                window._orderShowAllProducts = false;
+                const btn = document.getElementById('orderShowAllBtn');
+                if (btn) {
+                    btn.textContent = '👁️ Mostra tutti i prodotti';
+                    btn.classList.add('btn-secondary');
+                    btn.classList.remove('btn-warning');
+                }
+            }
             updateProductList();
             updateWarehouseList();
         }
@@ -1757,7 +2843,7 @@
                         <td style="font-size: 11px; color: #666;">${shortAddr}</td>
                         <td>
                             <button class="btn btn-warning btn-sm" onclick="editClient('${id}')" title="Modifica">✏️</button>
-                            ${id !== 'dimerca' && id !== 'altro' ? 
+                            ${id !== 'altro' ? 
                                 `<button class="btn btn-danger btn-sm" onclick="deleteClient('${id}')" title="Elimina">🗑️</button>` : 
                                 ''}
                         </td>
@@ -1786,7 +2872,7 @@
             document.getElementById('newClientName').focus();
         }
         
-        function saveClientEdit(originalId) {
+        async function saveClientEdit(originalId) {
             const newId = document.getElementById('newClientId').value.trim().toLowerCase().replace(/\s+/g, '_');
             const name = document.getElementById('newClientName').value.trim();
             const address = document.getElementById('newClientAddress').value.trim();
@@ -1808,7 +2894,21 @@
             }
             
             CLIENTS[newId] = { name, address };
-            dataModified = true; autoSave();
+            
+            // Sync Firebase
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Salvataggio cliente...');
+                    if (newId !== originalId) {
+                        await window.firebaseSync.deleteClient(originalId);
+                    }
+                    await window.firebaseSync.saveClient(newId, { name, address });
+                }
+            } catch (err) {
+                alert('⚠️ Cliente salvato in locale ma errore sul cloud: ' + err.message);
+            }
+            
+            dataModified = true;
             
             // Reset form
             document.getElementById('newClientId').value = '';
@@ -1823,13 +2923,13 @@
             renderClientsList();
             renderClientRadios();
             updateWarehouseList();
-            initMagazzinoSelects(); // Aggiorna dropdown clienti in magazzino
-            initChartClientSelect(); // Aggiorna dropdown clienti grafici
+            initMagazzinoSelects();
+            initChartClientSelect();
             updateStatus();
             alert('✅ Cliente modificato!');
         }
         
-        function addClient() {
+        async function addClient() {
             const id = document.getElementById('newClientId').value.trim().toLowerCase().replace(/\s+/g, '_');
             const name = document.getElementById('newClientName').value.trim();
             const address = document.getElementById('newClientAddress').value.trim();
@@ -1844,8 +2944,20 @@
                 return;
             }
             
-            CLIENTS[id] = { name, address };
-            dataModified = true; autoSave();
+            const clientData = { name, address };
+            CLIENTS[id] = clientData;
+            
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Salvataggio cliente...');
+                    await window.firebaseSync.saveClient(id, clientData);
+                    markSyncedAfterWrite(); // v42: evita blocco giallo se il listener tarda
+                }
+            } catch (err) {
+                alert('⚠️ Cliente salvato in locale ma errore sul cloud: ' + err.message);
+            }
+            
+            dataModified = true;
             
             document.getElementById('newClientId').value = '';
             document.getElementById('newClientName').value = '';
@@ -1854,20 +2966,127 @@
             renderClientsList();
             renderClientRadios();
             updateWarehouseList();
-            initMagazzinoSelects(); // Aggiorna dropdown clienti in magazzino
-            initChartClientSelect(); // Aggiorna dropdown clienti grafici
+            initMagazzinoSelects();
+            initChartClientSelect();
             updateStatus();
             alert('✅ Cliente aggiunto!');
         }
         
-        function deleteClient(id) {
-            if (!confirm(`Eliminare "${CLIENTS[id].name}"?`)) return;
+        async function deleteClient(id) {
+            const clientName = CLIENTS[id]?.name || id;
+            
+            // v41: controlla quanti prodotti sono associati a questo cliente
+            const associatedProducts = [];
+            const sharedProducts = []; // associati anche ad altri clienti
+            const exclusiveProducts = []; // associati SOLO a questo cliente
+            for (const code in CAT) {
+                if (isProductForClient(CAT[code], id)) {
+                    associatedProducts.push(code);
+                    const list = getProductClientList(CAT[code]);
+                    if (list.length > 1) {
+                        sharedProducts.push(code);
+                    } else {
+                        exclusiveProducts.push(code);
+                    }
+                }
+            }
+            
+            if (associatedProducts.length === 0) {
+                // Nessun prodotto associato: eliminazione normale con conferma semplice
+                if (!confirm(`Eliminare "${clientName}"?`)) return;
+                await finalizeDeleteClient(id);
+                return;
+            }
+            
+            // v45 (G15): ci sono prodotti associati → modale con bottoni chiari
+            const modal = document.getElementById('deleteClientModal');
+            const text = document.getElementById('deleteClientText');
+            text.innerHTML = `Il cliente <strong>${clientName}</strong> ha <strong>${associatedProducts.length}</strong> prodotti associati`
+                + (sharedProducts.length > 0 ? ` (di cui ${sharedProducts.length} condivisi anche con altri clienti)` : '')
+                + `.<br><br>Cosa vuoi fare con questi prodotti?`
+                + (sharedProducts.length > 0 ? `<br><br><span style="font-size:12px; color:#999;">Nota: i prodotti condivisi con altri clienti non verranno mai cancellati, verrà solo rimossa l'associazione a ${clientName}.</span>` : '');
+            modal.style.display = 'flex';
+            
+            const btnGeneric = document.getElementById('deleteClientGeneric');
+            const btnProducts = document.getElementById('deleteClientProducts');
+            const btnCancel = document.getElementById('deleteClientCancel');
+            
+            btnGeneric.onclick = async () => {
+                modal.style.display = 'none';
+                await makeProductsGeneric(id, associatedProducts);
+                await finalizeDeleteClient(id);
+            };
+            btnProducts.onclick = async () => {
+                modal.style.display = 'none';
+                await deleteExclusiveProducts(id, exclusiveProducts, sharedProducts);
+                await finalizeDeleteClient(id);
+            };
+            btnCancel.onclick = () => { modal.style.display = 'none'; };
+        }
+        
+        // v45: rende generici i prodotti (rimuove l'associazione cliente)
+        async function makeProductsGeneric(id, products) {
+            for (const code of products) {
+                const prod = CAT[code];
+                if (prod.clientRefs) delete prod.clientRefs[id];
+                if (id === 'dimerca' && prod.ref_dimerca) prod.ref_dimerca = null;
+                try {
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        await window.firebaseSync.saveCatalogItem(code, prod);
+                    }
+                } catch (err) {
+                    console.warn('Errore aggiornamento prodotto ' + code + ':', err);
+                }
+            }
+        }
+        
+        // v45: elimina i prodotti esclusivi del cliente; per i condivisi rimuove solo l'associazione
+        async function deleteExclusiveProducts(id, exclusiveProducts, sharedProducts) {
+            for (const code of exclusiveProducts) {
+                delete CAT[code];
+                const hadImage = IMG[code] !== undefined;
+                delete IMG[code];
+                try {
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        await window.firebaseSync.deleteCatalogItem(code);
+                        if (hadImage) await window.firebaseSync.deleteSingleImage(code);
+                    }
+                } catch (err) {
+                    console.warn('Errore eliminazione prodotto ' + code + ':', err);
+                }
+            }
+            for (const code of sharedProducts) {
+                const prod = CAT[code];
+                if (prod.clientRefs) delete prod.clientRefs[id];
+                if (id === 'dimerca' && prod.ref_dimerca) prod.ref_dimerca = null;
+                try {
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        await window.firebaseSync.saveCatalogItem(code, prod);
+                    }
+                } catch (err) {
+                    console.warn('Errore aggiornamento prodotto ' + code + ':', err);
+                }
+            }
+        }
+        
+        // v45: elimina il cliente e aggiorna la UI (parte comune a tutti i percorsi)
+        async function finalizeDeleteClient(id) {
             delete CLIENTS[id];
-            dataModified = true; autoSave();
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Eliminazione cliente...');
+                    await window.firebaseSync.deleteClient(id);
+                }
+            } catch (err) {
+                alert('⚠️ Cliente eliminato in locale ma errore sul cloud: ' + err.message);
+            }
+            
+            dataModified = true;
             renderClientsList();
             renderClientRadios();
-            initMagazzinoSelects(); // Aggiorna dropdown clienti in magazzino
-            initChartClientSelect(); // Aggiorna dropdown clienti grafici
+            renderProductsList();
+            initMagazzinoSelects();
+            initChartClientSelect();
             updateStatus();
         }
         
@@ -1943,40 +3162,155 @@
             return 999;
         }
         
-        function updateProductList() {
-            const select = document.getElementById('productSelect');
-            select.innerHTML = '<option value="">-- Seleziona prodotto --</option>';
+        // v41: helper riutilizzabile per ottenere prodotti filtrati e ordinati.
+        // clientFilter: ID cliente specifico → solo prodotti associati a quel cliente
+        //               (se il cliente non ha prodotti associati, ritorna i generici).
+        //               'altro' o qualsiasi cliente senza associazioni → solo generici (no clientRefs).
+        // showAll: se true, ignora il filtro e ritorna tutti i prodotti ordinati.
+        // Restituisce array di [code, product] già ordinato.
+        function getSortedProducts(clientFilter, showAll = false) {
+            if (showAll) {
+                return getAllProductsSorted();
+            }
             
-            const isDimerca = selectedClient === 'dimerca';
+            const hasAssociatedProducts = clientHasAssociatedProducts(clientFilter);
             
-            // Filtra e ordina prodotti
             let products = Object.entries(CAT).filter(([code, product]) => {
-                if (isDimerca) {
-                    return product.ref_dimerca; // Solo prodotti DiMerca
+                if (hasAssociatedProducts) {
+                    // Mostra SOLO i prodotti associati a quel cliente
+                    return isProductForClient(product, clientFilter);
                 } else {
-                    return !product.ref_dimerca; // Solo prodotti generici Media Pizza
+                    // Cliente senza associazioni → solo prodotti generici (nessun clientRefs)
+                    return isGenericProduct(product);
                 }
             });
             
-            // Ordina
             products.sort((a, b) => {
-                if (isDimerca) {
-                    // Ordina per codice DiMerca
-                    return parseInt(a[1].ref_dimerca) - parseInt(b[1].ref_dimerca);
+                if (hasAssociatedProducts) {
+                    // Ordina per ref cliente se presente (es: codici Dimerca), altrimenti per misura
+                    const refA = getProductRefForClient(a[1], clientFilter);
+                    const refB = getProductRefForClient(b[1], clientFilter);
+                    if (refA && refB) {
+                        const numA = parseInt(refA), numB = parseInt(refB);
+                        if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
+                        return refA.localeCompare(refB);
+                    }
+                    return getSizeFromDesc(a[1].descripcion) - getSizeFromDesc(b[1].descripcion);
                 } else {
-                    // Ordina per misura
                     return getSizeFromDesc(a[1].descripcion) - getSizeFromDesc(b[1].descripcion);
                 }
             });
             
+            return products;
+        }
+        
+        // v41: TRUE se un prodotto è associato a un determinato cliente
+        function isProductForClient(product, clientId) {
+            if (!product || !clientId) return false;
+            if (product.clientRefs && Object.keys(product.clientRefs).length > 0) {
+                return Object.prototype.hasOwnProperty.call(product.clientRefs, clientId);
+            }
+            // Fallback retrocompatibile: vecchio campo ref_dimerca
+            if (clientId === 'dimerca' && product.ref_dimerca) return true;
+            return false;
+        }
+        
+        // v41: TRUE se un prodotto è "generico" (nessuna associazione cliente)
+        function isGenericProduct(product) {
+            if (!product) return false;
+            if (product.clientRefs && Object.keys(product.clientRefs).length > 0) return false;
+            // Fallback retrocompatibile
+            if (product.ref_dimerca) return false;
+            return true;
+        }
+        
+        // v41: restituisce il codice/ref del prodotto per un cliente specifico (es: 6853 per Dimerca)
+        // Ritorna '' se non c'è un ref specifico per quel cliente.
+        function getProductRefForClient(product, clientId) {
+            if (!product || !clientId) return '';
+            if (product.clientRefs && product.clientRefs[clientId]) return product.clientRefs[clientId];
+            // Fallback retrocompatibile
+            if (clientId === 'dimerca' && product.ref_dimerca) return product.ref_dimerca;
+            return '';
+        }
+        
+        // v41: TRUE se un cliente ha almeno un prodotto associato in catalogo
+        function clientHasAssociatedProducts(clientId) {
+            if (!clientId || clientId === 'altro') return false;
+            for (const code in CAT) {
+                if (isProductForClient(CAT[code], clientId)) return true;
+            }
+            return false;
+        }
+        
+        // v41: restituisce lista clienti associati a un prodotto, con i loro ref (se presenti)
+        // Ritorna array di { clientId, clientName, ref } ordinato per nome cliente.
+        function getProductClientList(product) {
+            const result = [];
+            if (!product) return result;
+            const refs = product.clientRefs || {};
+            // Includi anche il vecchio ref_dimerca se non già migrato
+            if (product.ref_dimerca && !refs.dimerca) {
+                refs.dimerca = product.ref_dimerca;
+            }
+            for (const cid in refs) {
+                const cname = CLIENTS[cid]?.name || cid;
+                result.push({ clientId: cid, clientName: cname, ref: refs[cid] || '' });
+            }
+            result.sort((a, b) => a.clientName.localeCompare(b.clientName));
+            return result;
+        }
+        
+        // v41: migrazione automatica del campo ref_dimerca al nuovo schema clientRefs.
+        // Eseguita all'apertura del file e dopo caricamento da JSON o cloud.
+        function migrateCatalogClientRefs() {
+            let migrated = 0;
+            for (const code in CAT) {
+                const prod = CAT[code];
+                if (!prod) continue;
+                if (prod.ref_dimerca && (!prod.clientRefs || !prod.clientRefs.dimerca)) {
+                    if (!prod.clientRefs) prod.clientRefs = {};
+                    prod.clientRefs.dimerca = String(prod.ref_dimerca);
+                    migrated++;
+                }
+            }
+            if (migrated > 0) {
+                console.log('[v41 migrate] Migrati ' + migrated + ' prodotti da ref_dimerca a clientRefs.dimerca');
+            }
+        }
+        
+        function isStandardMPProduct(product) {
+            return isGenericProduct(product);
+        }
+        
+        function updateProductList() {
+            const select = document.getElementById('productSelect');
+            select.innerHTML = '<option value="">-- Seleziona prodotto --</option>';
+            
+            const showAll = !!window._orderShowAllProducts;
+            const products = getSortedProducts(selectedClient, showAll);
+            
             for (const [code, product] of products) {
-                const label = isDimerca && product.ref_dimerca
-                    ? `[${product.ref_dimerca}] ${code} - ${product.descripcion}`
+                const refClient = getProductRefForClient(product, selectedClient);
+                const label = refClient
+                    ? `[${refClient}] ${code} - ${product.descripcion}`
                     : `${code} - ${product.descripcion}`;
                 select.innerHTML += `<option value="${code}">${label}</option>`;
             }
             
             document.getElementById('productPreview').style.display = 'none';
+        }
+        
+        // v41: toggle "Mostra tutti i prodotti" nella creazione ordine
+        function toggleOrderShowAllProducts() {
+            window._orderShowAllProducts = !window._orderShowAllProducts;
+            const btn = document.getElementById('orderShowAllBtn');
+            if (btn) {
+                btn.textContent = window._orderShowAllProducts ? '👁️ Mostra solo del cliente' : '👁️ Mostra tutti i prodotti';
+                btn.classList.toggle('btn-secondary', !window._orderShowAllProducts);
+                btn.classList.toggle('btn-warning', window._orderShowAllProducts);
+            }
+            updateProductList();
         }
         
         function showProductPreview() {
@@ -1991,7 +3325,14 @@
             
             document.getElementById('previewImg').src = IMG[code] || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect fill="%23eee" width="100" height="100"/><text x="50" y="55" text-anchor="middle" fill="%23999">No IMG</text></svg>';
             document.getElementById('previewName').textContent = product.descripcion;
-            document.getElementById('previewCode').textContent = product.ref_dimerca ? `DiMerca: ${product.ref_dimerca} | Fornitore: ${code}` : `Codice: ${code}`;
+            // v41: mostra ref del cliente correntemente selezionato se presente, altrimenti il codice fornitore
+            const refForCurrentClient = getProductRefForClient(product, selectedClient);
+            if (refForCurrentClient) {
+                const clientName = CLIENTS[selectedClient]?.name || selectedClient;
+                document.getElementById('previewCode').textContent = `${clientName}: ${refForCurrentClient} | Fornitore: ${code}`;
+            } else {
+                document.getElementById('previewCode').textContent = `Codice: ${code}`;
+            }
             document.getElementById('previewQuality').textContent = `Qualità: ${product.qualita || 'N/A'}`;
             document.getElementById('previewPrice').textContent = `€${product.precio_venta}/pack (${product.pz_per_pack} pz)`;
             
@@ -2007,12 +3348,22 @@
                 return;
             }
             
-            let html = '<table><tr><th>Codice</th><th>DiMerca</th><th>Descrizione</th><th>€/Pack</th><th>Azioni</th></tr>';
+            // v41: nuova colonna "Cliente" con i clienti associati al prodotto
+            let html = '<table><tr><th>Codice</th><th>Cliente</th><th>Descrizione</th><th>€/Pack</th><th>Azioni</th></tr>';
             for (const [code, product] of products) {
+                const clientList = getProductClientList(product);
+                let clienteCell;
+                if (clientList.length === 0) {
+                    clienteCell = '<span style="color: #999;">Generico</span>';
+                } else {
+                    clienteCell = clientList.map(c => {
+                        return c.ref ? `${c.clientName} [${c.ref}]` : c.clientName;
+                    }).join(', ');
+                }
                 html += `
                     <tr>
                         <td><code>${code}</code></td>
-                        <td>${product.ref_dimerca || '-'}</td>
+                        <td>${clienteCell}</td>
                         <td>${product.descripcion}</td>
                         <td>€${product.precio_venta}</td>
                         <td>
@@ -2031,12 +3382,13 @@
             
             // Popola i campi del form
             document.getElementById('newProdCode').value = code;
-            document.getElementById('newProdDimerca').value = product.ref_dimerca || '';
             document.getElementById('newProdDesc').value = product.descripcion;
             document.getElementById('newProdQuality').value = product.qualita || '';
             document.getElementById('newProdPriceS').value = product.precio_venta;
             document.getElementById('newProdPriceA').value = product.precio_compra;
             document.getElementById('newProdPzPack').value = product.pz_per_pack;
+            // v41: clienti associati
+            loadNewProdClientRefsFrom(product);
             
             if (IMG[code]) {
                 const img = document.getElementById('newProdImgPreview');
@@ -2063,10 +3415,6 @@
                 case 'code':
                     input = document.getElementById('newProdCode');
                     list = document.getElementById('codeAutocomplete');
-                    break;
-                case 'dimerca':
-                    input = document.getElementById('newProdDimerca');
-                    list = document.getElementById('dimercaAutocomplete');
                     break;
                 case 'desc':
                     input = document.getElementById('newProdDesc');
@@ -2120,7 +3468,7 @@
                     </div>`;
                 } else {
                     html += `<div class="autocomplete-item" onclick="selectProductForEdit('${match.code}')">
-                        <strong>${match.display}</strong> ${match.product.ref_dimerca && field !== 'dimerca' ? `[${match.product.ref_dimerca}]` : ''}<br>
+                        <strong>${match.display}</strong> ${match.product.ref_dimerca ? `[${match.product.ref_dimerca}]` : ''}<br>
                         <small>${match.sub}</small>
                     </div>`;
                 }
@@ -2138,12 +3486,13 @@
         function selectProductForEdit(code) {
             const product = CAT[code];
             document.getElementById('newProdCode').value = code;
-            document.getElementById('newProdDimerca').value = product.ref_dimerca || '';
             document.getElementById('newProdDesc').value = product.descripcion;
             document.getElementById('newProdQuality').value = product.qualita || '';
             document.getElementById('newProdPriceS').value = product.precio_venta;
             document.getElementById('newProdPriceA').value = product.precio_compra;
             document.getElementById('newProdPzPack').value = product.pz_per_pack;
+            // v41: clienti associati
+            loadNewProdClientRefsFrom(product);
             
             if (IMG[code]) {
                 const img = document.getElementById('newProdImgPreview');
@@ -2226,11 +3575,11 @@
                     aiem: aiem,
                     igicAcquisto: igicAcquisto,
                     totalCosto: totalCost + aiem + igicAcquisto,
-                    margine: (totalListino + igicVendita) - (totalCost + aiem + igicAcquisto)
+                    margine: totalListino - (totalCost + aiem)
                 };
             }
             
-            dataModified = true; autoSave();
+            dataModified = true;
             renderProductsList();
             renderArchive();
             
@@ -2308,13 +3657,13 @@
                     totalVendita: totalListino + igicVendita,
                     costoFabbrica: totalCost, aiem, igicAcquisto,
                     totalCosto: totalCost + aiem + igicAcquisto,
-                    margine: (totalListino + igicVendita) - (totalCost + aiem + igicAcquisto)
+                    margine: totalListino - (totalCost + aiem)
                 };
             }
             
             // Reset lastPriceChange
             lastPriceChange = null;
-            dataModified = true; autoSave();
+            dataModified = true;
             renderProductsList();
             renderArchive();
             updateLastPriceChangeUI();
@@ -2322,9 +3671,85 @@
             alert(`✅ Inversione completata!\n\nApplicato ${inverseType} del ${inversePct.toFixed(4)}% a ${nProdotti} prodotti e ${nOrdini} ordini.\nI prezzi sono tornati ai valori originali.\n\n⚠️ Ricorda di esportare i dati!`);
         }
         
-        function addProduct() {
+        // v41: stato in editing del form prodotto per i clienti associati
+        // Array di { clientId, ref } (ref è una stringa, può essere vuota)
+        let _newProdClientRefsState = [];
+        
+        function renderNewProdClientRefs() {
+            const container = document.getElementById('newProdClientRefs');
+            if (!container) return;
+            
+            if (_newProdClientRefsState.length === 0) {
+                container.innerHTML = '<div style="font-size: 13px; color: #999; padding: 8px 0;">Nessun cliente associato. Il prodotto è generico Media Pizza.</div>';
+                return;
+            }
+            
+            let html = '';
+            _newProdClientRefsState.forEach((entry, idx) => {
+                let optionsHtml = '<option value="">-- Seleziona cliente --</option>';
+                for (const cid in CLIENTS) {
+                    if (cid === 'altro') continue;
+                    const isSel = cid === entry.clientId ? 'selected' : '';
+                    // Disabilita clienti già scelti in altre righe (evita duplicati)
+                    const alreadyChosen = _newProdClientRefsState.some((e, i) => i !== idx && e.clientId === cid);
+                    const disabled = alreadyChosen ? 'disabled' : '';
+                    optionsHtml += `<option value="${cid}" ${isSel} ${disabled}>${CLIENTS[cid].name}</option>`;
+                }
+                html += `
+                    <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 6px;">
+                        <select onchange="updateNewProdClientRef(${idx}, 'clientId', this.value)" style="flex: 1.5;">
+                            ${optionsHtml}
+                        </select>
+                        <input type="text" placeholder="Cod. cliente (opzionale)" value="${entry.ref || ''}" 
+                            oninput="updateNewProdClientRef(${idx}, 'ref', this.value)" style="flex: 1;">
+                        <button type="button" class="btn btn-danger btn-sm" onclick="removeNewProdClientRef(${idx})" title="Rimuovi">🗑️</button>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+        
+        function addNewProdClientRef() {
+            _newProdClientRefsState.push({ clientId: '', ref: '' });
+            renderNewProdClientRefs();
+        }
+        
+        function removeNewProdClientRef(idx) {
+            _newProdClientRefsState.splice(idx, 1);
+            renderNewProdClientRefs();
+        }
+        
+        function updateNewProdClientRef(idx, field, value) {
+            if (!_newProdClientRefsState[idx]) return;
+            _newProdClientRefsState[idx][field] = value;
+            // Se l'utente cambia il select, rerender per aggiornare le opzioni disabilitate
+            if (field === 'clientId') renderNewProdClientRefs();
+        }
+        
+        function resetNewProdClientRefs() {
+            _newProdClientRefsState = [];
+            renderNewProdClientRefs();
+        }
+        
+        function loadNewProdClientRefsFrom(product) {
+            const list = getProductClientList(product);
+            _newProdClientRefsState = list.map(c => ({ clientId: c.clientId, ref: c.ref }));
+            renderNewProdClientRefs();
+        }
+        
+        // v41: estrae il clientRefs corrente dal form
+        function collectNewProdClientRefs() {
+            const result = {};
+            for (const e of _newProdClientRefsState) {
+                if (!e.clientId) continue;
+                if (!CLIENTS[e.clientId]) continue;
+                result[e.clientId] = (e.ref || '').trim();
+            }
+            return result;
+        }
+        
+        async function addProduct() {
             const code = document.getElementById('newProdCode').value.trim();
-            const dimerca = document.getElementById('newProdDimerca').value.trim();
             const desc = document.getElementById('newProdDesc').value.trim();
             const quality = document.getElementById('newProdQuality').value.trim();
             const priceS = parseFloat(document.getElementById('newProdPriceS').value);
@@ -2337,8 +3762,13 @@
                 return;
             }
             
-            CAT[code] = {
-                ref_dimerca: dimerca || null,
+            // v41: clientRefs sostituisce ref_dimerca
+            const clientRefs = collectNewProdClientRefs();
+            const dimercaRef = clientRefs.dimerca || null; // mantiene retrocompatibilità
+            
+            const productData = {
+                ref_dimerca: dimercaRef, // mantenuto per retrocompatibilità con vecchi codici/export
+                clientRefs: clientRefs,
                 descripcion: desc,
                 qualita: quality,
                 precio_venta: priceS,
@@ -2346,15 +3776,34 @@
                 pz_per_pack: pzPack
             };
             
-            if (imgPreview.dataset.base64) {
-                IMG[code] = imgPreview.dataset.base64;
+            CAT[code] = productData;
+            
+            // Salva su Firebase (il listener aggiornerà gli altri dispositivi)
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Salvataggio prodotto...');
+                    await window.firebaseSync.saveCatalogItem(code, productData);
+                }
+            } catch (err) {
+                alert('⚠️ Prodotto salvato in locale ma errore sul cloud: ' + err.message);
             }
             
-            dataModified = true; autoSave();
+            // Gestione immagine
+            if (imgPreview.dataset.base64) {
+                IMG[code] = imgPreview.dataset.base64;
+                try {
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        await window.firebaseSync.saveSingleImage(code, imgPreview.dataset.base64);
+                    }
+                } catch (err) {
+                    console.warn('Errore salvataggio immagine:', err);
+                }
+            }
+            
+            dataModified = true;
             
             // Reset form
             document.getElementById('newProdCode').value = '';
-            document.getElementById('newProdDimerca').value = '';
             document.getElementById('newProdDesc').value = '';
             document.getElementById('newProdQuality').value = '';
             document.getElementById('newProdPriceS').value = '';
@@ -2363,6 +3812,7 @@
             document.getElementById('newProdImg').value = '';
             imgPreview.style.display = 'none';
             imgPreview.dataset.base64 = '';
+            resetNewProdClientRefs(); // v41
             
             renderProductsList();
             updateProductList();
@@ -2370,11 +3820,25 @@
             alert('✅ Prodotto aggiunto/aggiornato!');
         }
         
-        function deleteProduct(code) {
+        async function deleteProduct(code) {
             if (!confirm(`Eliminare "${code}"?`)) return;
             delete CAT[code];
+            const hadImage = IMG[code] !== undefined;
             delete IMG[code];
-            dataModified = true; autoSave();
+            
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Eliminazione prodotto...');
+                    await window.firebaseSync.deleteCatalogItem(code);
+                    if (hadImage) {
+                        await window.firebaseSync.deleteSingleImage(code);
+                    }
+                }
+            } catch (err) {
+                alert('⚠️ Prodotto eliminato in locale ma errore sul cloud: ' + err.message);
+            }
+            
+            dataModified = true;
             renderProductsList();
             updateProductList();
             updateStatus();
@@ -2602,7 +4066,7 @@
         // SALVATAGGIO ORDINE
         // =====================================
         
-        function saveOrder() {
+        async function saveOrder() {
             if (currentOrder.length === 0) {
                 alert('L\'ordine è vuoto!');
                 return;
@@ -2655,22 +4119,36 @@
                     aiem: aiem,
                     igicAcquisto: igicAcquisto,
                     totalCosto: totalCost + aiem + igicAcquisto,
-                    margine: (totalListino + igicVendita) - (totalCost + aiem + igicAcquisto)
+                    margine: totalListino - (totalCost + aiem)
                 }
             };
             
-            savedOrders.unshift(order);
+            // Controllo duplicati: se esiste già un ordine con stesso ref, chiedo conferma
+            const existingIndex = savedOrders.findIndex(o => o.ref === order.ref);
+            if (existingIndex !== -1 && !editingOriginalDate) {
+                if (!confirm(`Esiste già un ordine con riferimento ${order.ref}.\nVuoi sovrascriverlo?`)) {
+                    return;
+                }
+            }
+            
+            // Salva su Firebase. Il listener real-time aggiornerà savedOrders automaticamente.
+            try {
+                await syncOrderToFirebase(order);
+            } catch (err) {
+                alert('❌ Errore nel salvataggio su cloud: ' + err.message + '\n\nL\'ordine non è stato salvato. Riprova o controlla la connessione.');
+                return;
+            }
+            
             editingOriginalDate = null; // Reset dopo il salvataggio
-            dataModified = true; autoSave();
+            dataModified = true;
             
             currentOrder = [];
             updateOrderDisplay();
-            renderArchive();
-            updateStatus();
+            // renderArchive() e updateStatus() verranno chiamati dal listener Firebase
             generateOrderRef();
             document.getElementById('orderRefClient').value = '';
             
-            alert(`✅ Ordine ${orderRefMP} salvato!\n\n⚠️ Ricorda di esportare i dati!`);
+            alert(`✅ Ordine ${orderRefMP} salvato e sincronizzato!`);
         }
         
         // =====================================
@@ -2682,6 +4160,38 @@
             document.getElementById('archiveFilterFrom').value = '';
             document.getElementById('archiveFilterTo').value = '';
             document.getElementById('archiveSortBy').value = 'date_desc';
+            renderArchive();
+        }
+        
+        // v47: inverte manualmente lo stato "evaso" di un ordine, SENZA generare o
+        // toccare movimenti di magazzino. Serve per marcare ordini vecchi (storici)
+        // che non hanno il flag, o per correggere a mano.
+        async function toggleOrderEvaso(index) {
+            const order = savedOrders[index];
+            if (!order) return;
+            
+            const nuovoStato = !order.evaso;
+            order.evaso = nuovoStato;
+            if (nuovoStato) {
+                order.evasoDate = new Date().toISOString();
+                order.evasoType = 'manuale';
+            } else {
+                delete order.evasoDate;
+                delete order.evasoType;
+            }
+            
+            // Salva l'ordine aggiornato sul cloud
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Aggiornamento stato ordine...');
+                    await window.firebaseSync.saveOrder(order);
+                    markSyncedAfterWrite();
+                }
+            } catch (err) {
+                console.warn('Errore salvataggio stato evaso:', err);
+            }
+            
+            dataModified = true;
             renderArchive();
         }
         
@@ -2753,18 +4263,31 @@
                 return;
             }
             
-            let html = '<table><tr><th>Data</th><th>Rif. MP</th><th>Rif. Cliente</th><th>Cliente</th><th>Pezzi</th><th>Costo Fornitore</th><th>Vendita</th><th>Margine</th><th></th></tr>';
+            let html = '<table><tr><th>Data</th><th>Rif. MP</th><th>Rif. Cliente</th><th>Cliente</th><th>Stato</th><th>Pezzi</th><th>Costo Fornitore</th><th>Vendita</th><th>Margine</th><th></th></tr>';
             
             for (const { order, originalIndex: i } of filtered) {
                 const date = new Date(order.date).toLocaleDateString('it-IT');
                 const marginPct = ((order.totals.margine / order.totals.totalVendita) * 100).toFixed(1);
                 
+                // v42 (Bug I): evidenziazione ordini evasi
+                // v47: il tag è cliccabile per invertire manualmente lo stato evaso
+                const isEvaso = !!order.evaso;
+                const rowStyle = isEvaso ? ' style="background: #eef7ee;"' : '';
+                let statoCell;
+                if (isEvaso) {
+                    const tipoLabel = order.evasoType === 'cliente' ? 'Consegnato' : (order.evasoType === 'manuale' ? 'Segnato a mano' : 'In magazzino');
+                    statoCell = `<span onclick="toggleOrderEvaso(${i})" style="cursor:pointer; display: inline-block; background: #28a745; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; white-space: nowrap;" title="${tipoLabel} — clicca per segnare come Da evadere">✅ Evaso</span>`;
+                } else {
+                    statoCell = `<span onclick="toggleOrderEvaso(${i})" style="cursor:pointer; display: inline-block; background: #6c757d; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap;" title="Clicca per segnare come Evaso">Da evadere</span>`;
+                }
+                
                 html += `
-                    <tr>
+                    <tr${rowStyle}>
                         <td>${date}</td>
                         <td><code>${order.ref}</code></td>
                         <td>${order.refClient || '-'}</td>
                         <td>${order.clientName}</td>
+                        <td>${statoCell}</td>
                         <td>${order.totals.pieces.toLocaleString('it-IT')}</td>
                         <td style="font-weight: bold; color: #e67e22;">€${(order.totals.costoFabbrica || 0).toFixed(2)}</td>
                         <td>€${order.totals.totalVendita.toFixed(2)}</td>
@@ -2785,41 +4308,61 @@
             container.innerHTML = html;
         }
         
-        function deleteOrder(index) {
+        async function deleteOrder(index) {
             if (!confirm('Eliminare questo ordine?')) return;
-            savedOrders.splice(index, 1);
-            dataModified = true; autoSave();
-            renderArchive();
-            updateStatus();
+            const order = savedOrders[index];
+            if (!order) return;
+            
+            try {
+                await syncDeleteFromFirebase(order.ref);
+                // savedOrders verrà aggiornato dal listener real-time
+            } catch (err) {
+                alert('❌ Errore eliminazione su cloud: ' + err.message);
+                return;
+            }
+            
+            dataModified = true;
+            // renderArchive() e updateStatus() verranno chiamati dal listener
         }
         
-        function editOrder(index) {
+        async function editOrder(index) {
             const order = savedOrders[index];
+            if (!order) return;
             if (!confirm(`Modificare l'ordine ${order.ref}?\n\nL'ordine verrà rimosso dall'archivio e ricaricato nel pannello ordini. Ricordati di salvarlo nuovamente al termine.`)) return;
             
-            // Rimuovi dall'archivio
-            savedOrders.splice(index, 1);
-            dataModified = true; autoSave();
+            // Salva una copia locale dell'ordine PRIMA di eliminarlo da Firebase,
+            // perché il listener real-time potrebbe rimuoverlo da savedOrders prima
+            // che noi finiamo di leggere i suoi dati
+            const orderCopy = JSON.parse(JSON.stringify(order));
+            
+            // Rimuovi da Firebase (il listener aggiornerà savedOrders)
+            try {
+                await syncDeleteFromFirebase(orderCopy.ref);
+            } catch (err) {
+                alert('❌ Errore eliminazione su cloud: ' + err.message);
+                return;
+            }
+            
+            dataModified = true;
             
             // Salva la data originale per ripristinarla al salvataggio
-            editingOriginalDate = order.date;
+            editingOriginalDate = orderCopy.date;
             
-            // Ripristina i campi dell'ordine
-            currentOrder = JSON.parse(JSON.stringify(order.items));
-            selectedClient = order.client;
+            // Ripristina i campi dell'ordine usando la copia locale
+            currentOrder = JSON.parse(JSON.stringify(orderCopy.items));
+            selectedClient = orderCopy.client;
             
-            document.getElementById('orderRefMP').value = order.ref;
-            document.getElementById('orderRefClient').value = order.refClient || '';
+            document.getElementById('orderRefMP').value = orderCopy.ref;
+            document.getElementById('orderRefClient').value = orderCopy.refClient || '';
             
             // Aggiorna il selettore cliente
             const container = document.getElementById('orderClientContainer');
-            if (container && container.setValue) container.setValue(order.client);
-            updateSelectedClientInfo(order.client);
+            if (container && container.setValue) container.setValue(orderCopy.client);
+            updateSelectedClientInfo(orderCopy.client);
             
-            // Aggiorna display ordine e archivio
+            // Aggiorna display ordine
             updateOrderDisplay();
-            renderArchive();
-            updateStatus();
+            // renderArchive() e updateStatus() verranno chiamati dal listener
             
             // Passa al pannello ordine
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -2828,37 +4371,79 @@
             const tabOrdine = document.querySelector('.tab[onclick="showPanel(\'ordine\')"]');
             if (tabOrdine) tabOrdine.classList.add('active');
             
-            alert('Ordine ' + order.ref + ' caricato in modifica.\nApporta le modifiche necessarie e salva nuovamente.');
+            alert('Ordine ' + orderCopy.ref + ' caricato in modifica.\nApporta le modifiche necessarie e salva nuovamente.');
         }
         
         function caricoFromOrder(index) {
             const order = savedOrders[index];
             
-            if (!confirm(`Registrare il carico dell'ordine ${order.ref}?\n\nVerranno caricati nel pannello Magazzino tutti i prodotti e le quantità dell'ordine. Potrai modificarle prima di confermare.`)) return;
+            // Determina se l'ordine ha un cliente "vero" (non Generico/altro) per offrire la modalità diretta
+            const clientId = order.client;
+            const hasClient = clientId && clientId !== 'altro' && CLIENTS[clientId];
             
-            // Naviga prima al pannello Magazzino → Carico Container
+            if (hasClient) {
+                // v42 (Bug H): mostra la modale con due bottoni chiari invece del confirm OK/Annulla
+                const modal = document.getElementById('caricoChoiceModal');
+                const text = document.getElementById('caricoChoiceText');
+                text.innerHTML = `Ordine <strong>${order.ref}</strong> — Cliente <strong>${order.clientName || clientId}</strong>.<br><br>`
+                    + `Scegli <strong>Cliente</strong> per la consegna diretta (i prezzi di vendita verranno precompilati dall'ordine), `
+                    + `oppure <strong>Mediapizza</strong> per far entrare i prodotti in magazzino e rivenderli in seguito.`;
+                modal.style.display = 'flex';
+                
+                // Aggancia i bottoni (rimpiazza eventuali handler precedenti)
+                const btnCliente = document.getElementById('caricoChoiceCliente');
+                const btnMP = document.getElementById('caricoChoiceMediapizza');
+                const btnAnnulla = document.getElementById('caricoChoiceAnnulla');
+                
+                btnCliente.onclick = () => { modal.style.display = 'none'; proceedCaricoFromOrder(index, true); };
+                btnMP.onclick = () => { modal.style.display = 'none'; proceedCaricoFromOrder(index, false); };
+                btnAnnulla.onclick = () => { modal.style.display = 'none'; };
+            } else {
+                // Cliente generico: solo modalità magazzino MP, conferma semplice
+                if (!confirm(`Registrare il carico dell'ordine ${order.ref}?\n\nIl carico verrà registrato sul magazzino MP Tenerife.`)) return;
+                proceedCaricoFromOrder(index, false);
+            }
+        }
+        
+        // v42 (Bug H): logica di carico effettiva, separata dalla scelta della destinazione
+        function proceedCaricoFromOrder(index, isDiretto) {
+            const order = savedOrders[index];
+            const clientId = order.client;
+            
+            // Naviga al pannello Magazzino → Carico Container
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.getElementById('panel-magazzino').classList.add('active');
             const tabMag = document.querySelector('.tab[onclick="showPanel(\'magazzino\')"]');
             if (tabMag) tabMag.classList.add('active');
             
-            // Attiva il subpanel carico manualmente (senza event.target)
+            // Attiva il subpanel carico
             document.querySelectorAll('.subpanel').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.subtab').forEach(t => t.classList.remove('active'));
             document.getElementById('subpanel-carico').classList.add('active');
             const subtabCarico = document.querySelector('.subtab[onclick="showMagSubpanel(\'carico\')"]');
             if (subtabCarico) subtabCarico.classList.add('active');
             
-            // Assicura destinazione magazzino e triggera updateCaricoMode (che resetta caricoItems)
+            // Imposta destinazione e UI
             const dest = document.getElementById('caricoDestination');
             if (dest) {
-                dest.value = 'magazzino';
-                // Aggiorna la UI senza chiamare updateCaricoMode (che azzererebbe caricoItems)
-                document.getElementById('caricoClientSection').style.display = 'none';
-                document.getElementById('caricoFieldsNormal').style.display = 'block';
-                document.getElementById('caricoFieldsDiretto').style.display = 'none';
-                document.getElementById('caricoSummaryVendita').style.display = 'none';
+                dest.value = isDiretto ? 'cliente' : 'magazzino';
+                if (isDiretto) {
+                    document.getElementById('caricoClientSection').style.display = 'block';
+                    document.getElementById('caricoFieldsNormal').style.display = 'none';
+                    document.getElementById('caricoFieldsDiretto').style.display = 'block';
+                    document.getElementById('caricoSummaryVendita').style.display = 'block';
+                    // Imposta il cliente nel searchable select
+                    const clientContainer = document.getElementById('caricoClientContainer');
+                    if (clientContainer && clientContainer.setValue) {
+                        clientContainer.setValue(clientId);
+                    }
+                } else {
+                    document.getElementById('caricoClientSection').style.display = 'none';
+                    document.getElementById('caricoFieldsNormal').style.display = 'block';
+                    document.getElementById('caricoFieldsDiretto').style.display = 'none';
+                    document.getElementById('caricoSummaryVendita').style.display = 'none';
+                }
             }
             
             // Imposta la data di oggi
@@ -2872,23 +4457,35 @@
                 document.getElementById('caricoNote').value = `Carico da ordine ${order.ref}${order.refClient ? ' / ' + order.refClient : ''}`;
             }
             
-            // Converti gli items dell'ordine in caricoItems e assegna ADESSO (dopo tutto il reset UI)
+            // v42 (Bug I): memorizza il riferimento ordine sul carico, per marcarlo evaso
+            window._caricoFromOrderRef = order.ref;
+            window._caricoFromOrderIndex = index;
+            
+            // Converti gli items dell'ordine in caricoItems
+            // Se diretto al cliente: includi anche il prezzo di vendita (item.pricePerPack)
             const newCaricoItems = [];
             for (const item of order.items) {
                 const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
                 const packs = item.pallets * pkPerPallet;
-                newCaricoItems.push({
+                const newItem = {
                     code: item.code,
                     qty: packs,
                     costoPz: item.costPerPiece
-                });
+                };
+                if (isDiretto) {
+                    newItem.price = item.pricePerPack || 0;
+                }
+                newCaricoItems.push(newItem);
             }
             caricoItems = newCaricoItems;
             
             // Aggiorna la visualizzazione del carico
             renderCaricoItems();
             
-            alert(`📥 Carico dall'ordine ${order.ref} pronto!\n\nVerifica le quantità e il costo per pezzo, poi clicca "Registra Carico".`);
+            const tipoMsg = isDiretto 
+                ? `📥 Carico diretto al cliente ${order.clientName} pronto!\n\nVerifica quantità, costi e prezzi di vendita, poi clicca "Registra Carico".`
+                : `📥 Carico dall'ordine ${order.ref} pronto!\n\nVerifica le quantità e il costo per pezzo, poi clicca "Registra Carico".`;
+            alert(tipoMsg);
         }
         
         function exportArchiveExcel() {
@@ -3138,21 +4735,111 @@
         }
         
         function initMagazzinoSelects() {
-            // Popola select prodotti per carico
-            const caricoProd = document.getElementById('caricoProduct');
+            // v41: popola il select del filtro carico magazzino con i clienti dinamici
+            populateCaricoNormalFilter();
+            // Carico al magazzino (caricoProduct): popolato da updateCaricoProductsNormal con filtro
+            updateCaricoProductsNormal();
+            
+            // Scarico e Allineamento: popolati con ordinamento "umano"
+            // (per default mostriamo prodotti MP standard, l'utente può cambiare via cliente)
             const scaricoProd = document.getElementById('scaricoProduct');
             const allineamentoProd = document.getElementById('allineamentoProduct');
+            
+            // Per scarico/allineamento popoliamo con TUTTI i prodotti ordinati
+            // (lo scarico ha già il suo selettore cliente che filtra dopo)
+            const sortedAll = getAllProductsSorted();
             let prodOptions = '<option value="">-- Seleziona --</option>';
-            for (const [code, prod] of Object.entries(CAT)) {
-                const label = prod.ref_dimerca ? `[${prod.ref_dimerca}] ${prod.descripcion}` : `${code} - ${prod.descripcion}`;
+            for (const [code, prod] of sortedAll) {
+                // v41: usa il primo ref disponibile (es: codice Dimerca) per la label se presente
+                const list = getProductClientList(prod);
+                const refLabel = list.length === 1 && list[0].ref ? `[${list[0].ref}] ` : '';
+                const label = refLabel ? `${refLabel}${prod.descripcion}` : `${code} - ${prod.descripcion}`;
                 prodOptions += `<option value="${code}">${label}</option>`;
             }
-            if (caricoProd) caricoProd.innerHTML = prodOptions;
             if (scaricoProd) scaricoProd.innerHTML = prodOptions;
             if (allineamentoProd) allineamentoProd.innerHTML = prodOptions;
             
             // Inizializza searchable select per clienti
             initClientSearchableSelects();
+        }
+        
+        // v41: popola il select del filtro carico magazzino con i clienti che hanno prodotti associati
+        function populateCaricoNormalFilter() {
+            const select = document.getElementById('caricoNormalFilter');
+            if (!select) return;
+            const currentValue = select.value || 'generico';
+            
+            let options = '<option value="generico">Cliente Generico (MP)</option>';
+            // Trova tutti i clienti con almeno un prodotto associato
+            const clientsWithProducts = [];
+            for (const cid in CLIENTS) {
+                if (cid === 'altro') continue;
+                if (clientHasAssociatedProducts(cid)) {
+                    clientsWithProducts.push({ id: cid, name: CLIENTS[cid].name || cid });
+                }
+            }
+            clientsWithProducts.sort((a, b) => a.name.localeCompare(b.name));
+            for (const c of clientsWithProducts) {
+                options += `<option value="${c.id}">${c.name}</option>`;
+            }
+            select.innerHTML = options;
+            // Ripristina la selezione precedente se ancora valida
+            if (select.querySelector(`option[value="${currentValue}"]`)) {
+                select.value = currentValue;
+            }
+        }
+        
+        // v41: aggiorna la lista prodotti del carico al magazzino in base al filtro cliente
+        function updateCaricoProductsNormal() {
+            const select = document.getElementById('caricoProduct');
+            if (!select) return;
+            
+            const filterSelect = document.getElementById('caricoNormalFilter');
+            const filter = filterSelect ? filterSelect.value : 'generico';
+            const showAll = !!window._caricoNormalShowAll;
+            
+            // 'generico' → usa 'altro' come segnaposto per "nessun cliente associato"
+            const products = getSortedProducts(filter === 'generico' ? 'altro' : filter, showAll);
+            
+            let options = '<option value="">-- Seleziona --</option>';
+            for (const [code, prod] of products) {
+                const refClient = (filter !== 'generico') ? getProductRefForClient(prod, filter) : '';
+                const label = refClient
+                    ? `[${refClient}] ${code} - ${prod.descripcion}`
+                    : `${code} - ${prod.descripcion}`;
+                options += `<option value="${code}">${label}</option>`;
+            }
+            select.innerHTML = options;
+            
+            // Reset costo
+            const costoInput = document.getElementById('caricoCostoPz');
+            if (costoInput) costoInput.value = '';
+        }
+        
+        // v41: toggle "Mostra tutti i prodotti" nel carico magazzino
+        function toggleCaricoNormalShowAll() {
+            window._caricoNormalShowAll = !window._caricoNormalShowAll;
+            const btn = document.getElementById('caricoNormalShowAllBtn');
+            if (btn) {
+                btn.textContent = window._caricoNormalShowAll ? '👁️ Mostra solo filtrati' : '👁️ Mostra tutti';
+                btn.classList.toggle('btn-secondary', !window._caricoNormalShowAll);
+                btn.classList.toggle('btn-warning', window._caricoNormalShowAll);
+            }
+            updateCaricoProductsNormal();
+        }
+        
+        // v41: restituisce TUTTI i prodotti, ordinati prima per "tipo" (MP generici poi clienti)
+        // e dentro ogni gruppo per dimensione/codice. Usato per scarico e allineamento.
+        function getAllProductsSorted() {
+            const generic = [];
+            const associated = [];
+            for (const entry of Object.entries(CAT)) {
+                if (isGenericProduct(entry[1])) generic.push(entry);
+                else associated.push(entry);
+            }
+            generic.sort((a, b) => getSizeFromDesc(a[1].descripcion) - getSizeFromDesc(b[1].descripcion));
+            associated.sort((a, b) => getSizeFromDesc(a[1].descripcion) - getSizeFromDesc(b[1].descripcion));
+            return [...generic, ...associated];
         }
         
         function initClientSearchableSelects() {
@@ -3214,17 +4901,30 @@
         function updateScaricoProducts() {
             const clientId = getScaricoClientValue();
             const scaricoProd = document.getElementById('scaricoProduct');
-            const isDimerca = clientId === 'dimerca';
+            
+            const showAll = !!window._scaricoShowAllProducts;
+            const products = getSortedProducts(clientId, showAll);
             
             let prodOptions = '<option value="">-- Seleziona --</option>';
-            for (const [code, prod] of Object.entries(CAT)) {
-                if (isDimerca && !prod.ref_dimerca) continue;
-                if (!isDimerca && prod.ref_dimerca) continue;
-                const label = prod.ref_dimerca ? `[${prod.ref_dimerca}] ${prod.descripcion}` : `${code} - ${prod.descripcion}`;
+            for (const [code, prod] of products) {
+                const refClient = getProductRefForClient(prod, clientId);
+                const label = refClient ? `[${refClient}] ${prod.descripcion}` : `${code} - ${prod.descripcion}`;
                 prodOptions += `<option value="${code}">${label}</option>`;
             }
             scaricoProd.innerHTML = prodOptions;
             document.getElementById('scaricoPrice').value = '';
+        }
+        
+        // v41: toggle "Mostra tutti i prodotti" nello scarico
+        function toggleScaricoShowAllProducts() {
+            window._scaricoShowAllProducts = !window._scaricoShowAllProducts;
+            const btn = document.getElementById('scaricoShowAllBtn');
+            if (btn) {
+                btn.textContent = window._scaricoShowAllProducts ? '👁️ Mostra solo del cliente' : '👁️ Mostra tutti i prodotti';
+                btn.classList.toggle('btn-secondary', !window._scaricoShowAllProducts);
+                btn.classList.toggle('btn-warning', window._scaricoShowAllProducts);
+            }
+            updateScaricoProducts();
         }
         
         function updateScaricoPrice() {
@@ -3271,13 +4971,13 @@
         function updateCaricoProducts() {
             const clientId = getCaricoClientValue();
             const select = document.getElementById('caricoProductDiretto');
-            const isDimerca = clientId === 'dimerca';
+            const showAll = !!window._caricoDirettoShowAll;
+            const products = getSortedProducts(clientId, showAll);
             
             let options = '<option value="">-- Seleziona --</option>';
-            for (const [code, prod] of Object.entries(CAT)) {
-                if (isDimerca && !prod.ref_dimerca) continue;
-                if (!isDimerca && prod.ref_dimerca) continue;
-                const label = prod.ref_dimerca ? `[${prod.ref_dimerca}] ${prod.descripcion}` : `${code} - ${prod.descripcion}`;
+            for (const [code, prod] of products) {
+                const refClient = getProductRefForClient(prod, clientId);
+                const label = refClient ? `[${refClient}] ${prod.descripcion}` : `${code} - ${prod.descripcion}`;
                 options += `<option value="${code}">${label}</option>`;
             }
             select.innerHTML = options;
@@ -3285,6 +4985,18 @@
             // Reset prezzi
             document.getElementById('caricoCostoPzDiretto').value = '';
             document.getElementById('caricoPrezzoPackDiretto').value = '';
+        }
+        
+        // v41: toggle "Mostra tutti i prodotti" nel carico diretto a cliente
+        function toggleCaricoDirettoShowAll() {
+            window._caricoDirettoShowAll = !window._caricoDirettoShowAll;
+            const btn = document.getElementById('caricoDirettoShowAllBtn');
+            if (btn) {
+                btn.textContent = window._caricoDirettoShowAll ? '👁️ Mostra solo del cliente' : '👁️ Mostra tutti i prodotti';
+                btn.classList.toggle('btn-secondary', !window._caricoDirettoShowAll);
+                btn.classList.toggle('btn-warning', window._caricoDirettoShowAll);
+            }
+            updateCaricoProducts();
         }
         
         function updateCaricoPrice() {
@@ -3506,6 +5218,13 @@
         function fifoAddLot(code, qty, costoPz, date, movId, lotto) {
             if (!FIFO_STOCK[code]) FIFO_STOCK[code] = [];
             FIFO_STOCK[code].push({ qty, costoPz, date, movId, lotto: lotto || '' });
+            // v44 (B1): mantieni i lotti ordinati per data crescente (FIFO = più vecchi prima),
+            // così un lotto con data più vecchia inserito dopo va al posto giusto, non in fondo.
+            FIFO_STOCK[code].sort((a, b) => {
+                if (a.date < b.date) return -1;
+                if (a.date > b.date) return 1;
+                return 0;
+            });
         }
         
         // Calcola il costo FIFO per 'qtyPacks' pack di 'code' SENZA consumare i lotti
@@ -3540,37 +5259,203 @@
             };
         }
         
-        // Consuma i lotti FIFO per 'qtyPacks' pack (da chiamare SOLO quando si registra uno scarico)
+        // v40: Consuma i lotti FIFO per 'qtyPacks' pack e RESTITUISCE il tracking
+        // del consumo, per poter ripristinare in caso di modifica del movimento.
+        // Restituisce: [{ movId, costoPz, qtyPacks, pzPerPack, lotto, date }, ...]
         function consumeFifo(code, qtyPacks) {
             const prod = CAT[code];
-            if (!prod) return;
+            if (!prod) return [];
             const pzPerPack = prod.pz_per_pack || 1;
-            let pzDaConsumbare = qtyPacks * pzPerPack;
+            let packDaConsumare = qtyPacks;
+            const tracking = [];
             
             const lotti = FIFO_STOCK[code] || [];
-            while (pzDaConsumbare > 0 && lotti.length > 0) {
+            while (packDaConsumare > 0 && lotti.length > 0) {
                 const lotto = lotti[0];
-                const pzLotto = lotto.qty * pzPerPack;
-                if (pzDaConsumbare >= pzLotto) {
-                    pzDaConsumbare -= pzLotto;
-                    lotti.shift(); // consuma tutto il lotto
+                if (packDaConsumare >= lotto.qty) {
+                    // consuma tutto il lotto
+                    tracking.push({
+                        movId: lotto.movId,
+                        costoPz: lotto.costoPz,
+                        qtyPacks: lotto.qty,
+                        pzPerPack: pzPerPack,
+                        lotto: lotto.lotto || '',
+                        date: lotto.date
+                    });
+                    packDaConsumare -= lotto.qty;
+                    lotti.shift();
                 } else {
                     // consuma parzialmente
-                    const packConsumate = Math.floor(pzDaConsumbare / pzPerPack);
-                    const pzRimanenti = pzDaConsumbare % pzPerPack;
-                    lotto.qty -= packConsumate;
-                    if (pzRimanenti > 0) {
-                        // caso raro: scarico di pezzi non multipli di pack
-                        // consumiamo 1 pack in più e aggiustiamo
-                        lotto.qty -= 1;
-                    }
-                    pzDaConsumbare = 0;
+                    tracking.push({
+                        movId: lotto.movId,
+                        costoPz: lotto.costoPz,
+                        qtyPacks: packDaConsumare,
+                        pzPerPack: pzPerPack,
+                        lotto: lotto.lotto || '',
+                        date: lotto.date
+                    });
+                    lotto.qty -= packDaConsumare;
+                    packDaConsumare = 0;
                 }
             }
             FIFO_STOCK[code] = lotti;
+            return tracking;
         }
         
-        function registraCarico() {
+        // v40: Ripristina i lotti FIFO consumati da un movimento di scarico.
+        // Usato quando si modifica un movimento esistente: prima si "annulla" il consumo
+        // precedente, poi si registra il nuovo consumo.
+        // v46: ricerca robusta del lotto (movId + costoPz + date) per non confondere
+        // lotti diversi e non creare duplicati.
+        function restoreFifoFromMovement(mov) {
+            if (!mov || !mov.items) return;
+            for (const item of mov.items) {
+                if (!item.fifoConsumed || !Array.isArray(item.fifoConsumed)) continue;
+                if (!FIFO_STOCK[item.code]) FIFO_STOCK[item.code] = [];
+                
+                for (const consumo of item.fifoConsumed) {
+                    // v46: cerca il lotto con stessa firma (movId + costoPz + date), non solo movId
+                    const lottoEsistente = FIFO_STOCK[item.code].find(l =>
+                        l.movId === consumo.movId &&
+                        l.costoPz === consumo.costoPz &&
+                        l.date === consumo.date
+                    );
+                    if (lottoEsistente) {
+                        lottoEsistente.qty += consumo.qtyPacks;
+                    } else {
+                        FIFO_STOCK[item.code].push({
+                            qty: consumo.qtyPacks,
+                            costoPz: consumo.costoPz,
+                            date: consumo.date,
+                            movId: consumo.movId,
+                            lotto: consumo.lotto || ''
+                        });
+                    }
+                }
+                
+                // Consolida eventuali lotti duplicati (stessa firma) e riordina per data
+                FIFO_STOCK[item.code] = consolidaLotti(FIFO_STOCK[item.code]);
+            }
+        }
+        
+        // v46: unisce lotti con stessa firma (movId+costoPz+date) e ordina per data crescente
+        function consolidaLotti(lotti) {
+            const mappa = {};
+            for (const l of lotti) {
+                const key = (l.movId || '') + '|' + l.costoPz + '|' + l.date;
+                if (mappa[key]) {
+                    mappa[key].qty += l.qty;
+                } else {
+                    mappa[key] = { ...l };
+                }
+            }
+            const result = Object.values(mappa).filter(l => l.qty > 0);
+            result.sort((a, b) => {
+                if (a.date < b.date) return -1;
+                if (a.date > b.date) return 1;
+                return 0;
+            });
+            return result;
+        }
+        
+        // v46: ricostruisce FIFO_STOCK da zero ripercorrendo tutti i movimenti in ordine
+        // cronologico. È il "salvagente" se i lotti si sono sporcati. Ritorna un report.
+        function ricostruisciFifoDaMovimenti() {
+            // Ordina i movimenti dal più VECCHIO al più recente (per data, poi per createdAt)
+            const ordinati = [...MOVEMENTS].sort((a, b) => {
+                const da = a.date || '', db = b.date || '';
+                if (da !== db) return da < db ? -1 : 1;
+                const ca = a.createdAt || '', cb = b.createdAt || '';
+                return ca < cb ? -1 : (ca > cb ? 1 : 0);
+            });
+            
+            const nuovoFifo = {};
+            let carichiApplicati = 0, scarichiApplicati = 0, storniApplicati = 0;
+            
+            for (const mov of ordinati) {
+                if (mov.type === 'carico' && !mov.isDiretto) {
+                    // Aggiungi un lotto per ogni item
+                    for (const item of mov.items) {
+                        if (!nuovoFifo[item.code]) nuovoFifo[item.code] = [];
+                        nuovoFifo[item.code].push({
+                            qty: item.qty,
+                            costoPz: item.costoPz || 0,
+                            date: mov.date,
+                            movId: mov.id,
+                            lotto: mov.lotto || ''
+                        });
+                        nuovoFifo[item.code] = consolidaLotti(nuovoFifo[item.code]);
+                    }
+                    carichiApplicati++;
+                } else if (mov.type === 'scarico' && !mov.fromCaricoDiretto) {
+                    // Consuma i lotti FIFO (dal più vecchio)
+                    for (const item of mov.items) {
+                        const lotti = nuovoFifo[item.code] || [];
+                        let daConsumare = item.qty;
+                        while (daConsumare > 0 && lotti.length > 0) {
+                            const l = lotti[0];
+                            if (daConsumare >= l.qty) {
+                                daConsumare -= l.qty;
+                                lotti.shift();
+                            } else {
+                                l.qty -= daConsumare;
+                                daConsumare = 0;
+                            }
+                        }
+                        nuovoFifo[item.code] = lotti;
+                    }
+                    scarichiApplicati++;
+                } else if (mov.type === 'allineamento') {
+                    // Gli allineamenti (incluso lo storno) modificano lo stock; per il FIFO
+                    // li trattiamo come aggiustamento sul lotto più recente o creazione.
+                    // Se positivo, aggiunge un lotto generico; se negativo, consuma.
+                    for (const item of mov.items) {
+                        if (!nuovoFifo[item.code]) nuovoFifo[item.code] = [];
+                        if (item.qty > 0) {
+                            const prod = CAT[item.code];
+                            nuovoFifo[item.code].push({
+                                qty: item.qty,
+                                costoPz: prod?.precio_compra || 0,
+                                date: mov.date,
+                                movId: mov.id,
+                                lotto: ''
+                            });
+                            nuovoFifo[item.code] = consolidaLotti(nuovoFifo[item.code]);
+                        } else if (item.qty < 0) {
+                            const lotti = nuovoFifo[item.code] || [];
+                            let daConsumare = -item.qty;
+                            while (daConsumare > 0 && lotti.length > 0) {
+                                const l = lotti[0];
+                                if (daConsumare >= l.qty) { daConsumare -= l.qty; lotti.shift(); }
+                                else { l.qty -= daConsumare; daConsumare = 0; }
+                            }
+                            nuovoFifo[item.code] = lotti;
+                        }
+                    }
+                    storniApplicati++;
+                }
+            }
+            
+            FIFO_STOCK = nuovoFifo;
+            return { carichiApplicati, scarichiApplicati, storniApplicati };
+        }
+        
+        // v46: handler del bottone "Ricostruisci FIFO da movimenti"
+        async function ricostruisciFifoUI() {
+            if (!confirm('🔧 Ricostruire i lotti FIFO da zero?\n\nI lotti FIFO verranno ricalcolati ripercorrendo tutti i movimenti (carichi, scarichi, storni) in ordine cronologico.\n\nLo stock del magazzino NON viene toccato, solo i lotti FIFO vengono rimessi in ordine.\n\nUtile se i lotti si sono "sporcati". Continuare?')) return;
+            
+            const report = ricostruisciFifoDaMovimenti();
+            dataModified = true;
+            
+            await syncWarehouseToCloud();
+            
+            refreshFifoIfVisible();
+            renderStock();
+            
+            alert(`✅ Lotti FIFO ricostruiti!\n\n• ${report.carichiApplicati} carichi applicati\n• ${report.scarichiApplicati} scarichi applicati\n• ${report.storniApplicati} allineamenti/storni applicati\n\nI lotti sono ora coerenti con lo storico movimenti.`);
+        }
+        
+        async function registraCarico() {
             const date = document.getElementById('caricoDate').value;
             const warehouse = DEFAULT_WAREHOUSE;
             const note = document.getElementById('caricoNote').value.trim();
@@ -3596,6 +5481,11 @@
             // Inizializza magazzino se non esiste
             if (!INVENTORY[warehouse]) INVENTORY[warehouse] = {};
             
+            // v44 (Bug 2 FIFO): genero l'ID del movimento PRIMA, così il lotto FIFO
+            // viene creato con lo STESSO movId del movimento di carico. Senza questo,
+            // storno e modifica del carico non trovavano il lotto (movId non corrispondente).
+            const caricoMovId = 'MOV-' + Date.now();
+            
             // Calcola totali
             let totalPacks = 0, totalCostoFabbrica = 0, totalVendita = 0;
             for (const item of caricoItems) {
@@ -3612,8 +5502,8 @@
                     // Se non è diretto, aggiungi allo stock
                     if (!INVENTORY[warehouse][item.code]) INVENTORY[warehouse][item.code] = 0;
                     INVENTORY[warehouse][item.code] += item.qty;
-                    // Aggiungi lotto FIFO
-                    fifoAddLot(item.code, item.qty, item.costoPz || 0, date, 'MOV-' + Date.now(), lotto);
+                    // Aggiungi lotto FIFO con il movId reale del movimento
+                    fifoAddLot(item.code, item.qty, item.costoPz || 0, date, caricoMovId, lotto);
                 }
             }
             
@@ -3622,7 +5512,7 @@
             
             // Registra movimento CARICO
             const movementCarico = {
-                id: 'MOV-' + Date.now(),
+                id: caricoMovId,
                 type: 'carico',
                 date: date,
                 warehouse: warehouse,
@@ -3670,7 +5560,32 @@
                 MOVEMENTS.unshift(movementScarico);
             }
             
-            dataModified = true; autoSave();
+            // v42 (Bug I): se il carico proviene da un ordine, marca l'ordine come evaso
+            if (window._caricoFromOrderRef) {
+                const ordIdx = savedOrders.findIndex(o => o.ref === window._caricoFromOrderRef);
+                if (ordIdx !== -1) {
+                    savedOrders[ordIdx].evaso = true;
+                    savedOrders[ordIdx].evasoDate = new Date().toISOString();
+                    savedOrders[ordIdx].evasoType = isDiretto ? 'cliente' : 'magazzino';
+                    // Salva l'ordine aggiornato sul cloud
+                    try {
+                        if (window.firebaseSync && window.firebaseSync.ready) {
+                            await window.firebaseSync.saveOrder(savedOrders[ordIdx]);
+                        }
+                    } catch (err) {
+                        console.warn('Errore salvataggio stato evaso ordine:', err);
+                    }
+                    if (typeof renderArchive === 'function') renderArchive();
+                }
+                // Reset del riferimento
+                window._caricoFromOrderRef = null;
+                window._caricoFromOrderIndex = null;
+            }
+            
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             // Reset form
             caricoItems = [];
@@ -3681,6 +5596,7 @@
             renderCaricoItems();
             updateStatus();
             initChartClientSelect();
+            refreshFifoIfVisible(); // v44
             
             if (isDiretto) {
                 const margine = totalVendita - costoTotale;
@@ -3830,7 +5746,7 @@
             renderScaricoItems();
         }
         
-        function registraScarico() {
+        async function registraScarico() {
             const date = document.getElementById('scaricoDate').value;
             const clientId = getScaricoClientValue();
             const warehouse = DEFAULT_WAREHOUSE;
@@ -3869,8 +5785,8 @@
                 
                 // Sottrai da stock
                 INVENTORY[warehouse][item.code] -= item.qty;
-                // Consuma i lotti FIFO
-                consumeFifo(item.code, item.qty);
+                // v40: Consuma i lotti FIFO e salva il tracking nell'item
+                item.fifoConsumed = consumeFifo(item.code, item.qty);
             }
             
             // Calcoli - Margine calcolato SENZA IGIC (l'IGIC va allo stato)
@@ -3899,12 +5815,16 @@
             };
             
             MOVEMENTS.unshift(movement);
-            dataModified = true; autoSave();
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             // Reset form
             scaricoItems = [];
             document.getElementById('scaricoNote').value = '';
             renderScaricoItems();
+            refreshFifoIfVisible(); // v44
             updateStatus();
             
             alert(`✅ Consegna registrata!\n\n${totalPacks} pack consegnati a ${CLIENTS[clientId]?.name}\nVendita: €${totalVendita.toFixed(2)}\nMargine: €${margine.toFixed(2)}`);
@@ -3913,6 +5833,43 @@
         // =====================================
         // MAGAZZINO - STOCK VIEW
         // =====================================
+        
+        // v35: porta l'utente al pannello Panoramica con il prodotto preselezionato
+        function goToProductOverview(code) {
+            if (!code || !CAT[code]) {
+                alert('Prodotto non trovato nel catalogo');
+                return;
+            }
+            
+            // Cambia al pannello panoramica
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById('panel-panoramica').classList.add('active');
+            const tabPanoramica = document.querySelector('.tab[onclick="showPanel(\'panoramica\')"]');
+            if (tabPanoramica) tabPanoramica.classList.add('active');
+            
+            // Preseleziona il prodotto nel filtro
+            const productSelect = document.getElementById('panoramicaProduct');
+            if (productSelect) {
+                // Verifica che l'opzione esista, altrimenti la aggiunge al volo
+                const exists = Array.from(productSelect.options).some(opt => opt.value === code);
+                if (!exists) {
+                    const opt = document.createElement('option');
+                    opt.value = code;
+                    opt.textContent = `${code} - ${CAT[code].descripcion}`;
+                    productSelect.appendChild(opt);
+                }
+                productSelect.value = code;
+            }
+            
+            // Aggiorna la panoramica con il filtro applicato
+            if (typeof updatePanoramica === 'function') {
+                updatePanoramica();
+            }
+            
+            // Scroll in cima alla pagina
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
         
         function renderStock() {
             const container = document.getElementById('stockDisplay');
@@ -3925,16 +5882,52 @@
             
             const whStock = INVENTORY[warehouse] || {};
             
-            // Ordina i prodotti per descrizione
-            const sortedEntries = Object.entries(whStock)
-                .filter(([code, qty]) => qty > 0 && CAT[code])
-                .sort((a, b) => {
-                    const prodA = CAT[a[0]];
-                    const prodB = CAT[b[0]];
-                    return (prodA?.descripcion || '').localeCompare(prodB?.descripcion || '');
-                });
+            // v35: costruisce la lista dei prodotti da mostrare seguendo le regole:
+            // - Prodotti MP standard (no ref_dimerca) che HANNO MAI AVUTO un carico storico → sempre visibili (anche a 0)
+            // - Prodotti specifici per cliente (con ref_dimerca) → visibili solo se qty > 0
+            // - Tutti gli altri prodotti del magazzino con qty > 0 (per sicurezza)
             
-            for (const [code, qty] of sortedEntries) {
+            // Codici che hanno almeno un carico storico = chiavi di INVENTORY (anche con qty 0)
+            const everLoadedCodes = new Set(Object.keys(whStock));
+            
+            // Costruisci la lista finale
+            const productsToShow = [];
+            for (const code of everLoadedCodes) {
+                const prod = CAT[code];
+                if (!prod) continue; // prodotto eliminato dal catalogo
+                
+                const qty = whStock[code] || 0;
+                const isStandard = isStandardMPProduct(prod);
+                
+                if (isStandard) {
+                    // MP standard: sempre visibile (anche a 0)
+                    productsToShow.push([code, qty]);
+                } else {
+                    // Specifico per cliente: solo se ha stock
+                    if (qty > 0) productsToShow.push([code, qty]);
+                }
+            }
+            
+            // Ordinamento "umano": prima MP standard ordinati per misura, poi Dimerca per ref_dimerca
+            productsToShow.sort((a, b) => {
+                const prodA = CAT[a[0]];
+                const prodB = CAT[b[0]];
+                const aIsStd = isStandardMPProduct(prodA);
+                const bIsStd = isStandardMPProduct(prodB);
+                
+                // I prodotti MP standard vengono prima
+                if (aIsStd && !bIsStd) return -1;
+                if (!aIsStd && bIsStd) return 1;
+                
+                if (aIsStd && bIsStd) {
+                    // Entrambi MP: ordina per misura
+                    return getSizeFromDesc(prodA.descripcion) - getSizeFromDesc(prodB.descripcion);
+                }
+                // Entrambi Dimerca: ordina per ref_dimerca numerico
+                return parseInt(prodA.ref_dimerca) - parseInt(prodB.ref_dimerca);
+            });
+            
+            for (const [code, qty] of productsToShow) {
                 hasStock = true;
                 
                 const prod = CAT[code];
@@ -3946,11 +5939,11 @@
                 totalPacks += qty;
                 
                 let cardClass = 'stock-card';
-                if (qty < 10) cardClass += ' low-stock';
+                if (qty > 0 && qty < 10) cardClass += ' low-stock';
                 if (qty === 0) cardClass += ' out-of-stock';
                 
                 html += `
-                    <div class="${cardClass}">
+                    <div class="${cardClass}" style="cursor: pointer;" onclick="goToProductOverview('${code.replace(/'/g, "\\'")}')" title="Clicca per vedere statistiche dettagliate">
                         <h4>${prod.descripcion}</h4>
                         <p style="font-size: 11px; color: #666; margin-bottom: 8px;">${code}</p>
                         <div class="stock-qty">${qty}</div>
@@ -3984,6 +5977,15 @@
             } else {
                 fifoDiv.style.display = 'none';
                 btn.textContent = '🏷️ Mostra Lotti FIFO';
+            }
+        }
+        
+        // v44: ridisegna la vista lotti FIFO se è attualmente aperta, così dopo uno
+        // scarico/carico/storno i lotti si aggiornano a schermo senza dover ricaricare.
+        function refreshFifoIfVisible() {
+            const fifoDiv = document.getElementById('fifoDisplay');
+            if (fifoDiv && fifoDiv.style.display !== 'none') {
+                renderFifoDisplay();
             }
         }
         
@@ -4072,7 +6074,7 @@
                 fifoAddLot(code, qty, prod.precio_compra, today, 'INIT-' + Date.now(), lotto);
             }
             
-            dataModified = true; autoSave();
+            dataModified = true;
             
             // Aggiorna UI
             if (document.getElementById('fifoDisplay').style.display !== 'none') {
@@ -4348,7 +6350,7 @@
             renderAllineamentoItems();
         }
         
-        function registraAllineamento() {
+        async function registraAllineamento() {
             const date = document.getElementById('allineamentoDate').value;
             const note = document.getElementById('allineamentoNote').value.trim();
             
@@ -4388,7 +6390,10 @@
             };
             
             MOVEMENTS.unshift(movement);
-            dataModified = true; autoSave();
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             // Reset form
             allineamentoItems = [];
@@ -4403,7 +6408,9 @@
         // MODIFICA/ELIMINA MOVIMENTI
         // =====================================
         
-        function deleteMovement(movId) {
+        async function deleteMovement(movId) {
+            // v40: NON cancella più, crea un movimento di STORNO (opposto)
+            // L'originale resta nello storico, lo storno lo compensa.
             const movIndex = MOVEMENTS.findIndex(m => m.id === movId);
             if (movIndex === -1) {
                 alert('Movimento non trovato');
@@ -4411,52 +6418,175 @@
             }
             
             const mov = MOVEMENTS[movIndex];
-            let confirmMsg = `Eliminare questo movimento?\n\n`;
+            const dataOrig = new Date(mov.date).toLocaleDateString('it-IT');
+            let confirmMsg = `Stornare questo movimento?\n\n`;
             confirmMsg += `Tipo: ${mov.type === 'carico' ? (mov.isDiretto ? 'Carico Diretto' : 'Carico') : mov.type === 'scarico' ? 'Scarico' : 'Allineamento'}\n`;
-            confirmMsg += `Data: ${new Date(mov.date).toLocaleDateString('it-IT')}\n`;
+            confirmMsg += `Data: ${dataOrig}\n`;
             confirmMsg += `Pack: ${mov.totals.packs}\n\n`;
-            if (!mov.isDiretto) {
-                confirmMsg += `⚠️ Lo stock verrà ripristinato automaticamente.`;
-            }
+            confirmMsg += `Verrà creato un movimento opposto che annulla questo. L'originale resta nello storico.`;
             
             if (!confirm(confirmMsg)) return;
             
-            // Ripristina stock (solo se non è carico diretto)
             if (!INVENTORY[DEFAULT_WAREHOUSE]) INVENTORY[DEFAULT_WAREHOUSE] = {};
+            const today = new Date().toISOString().slice(0, 10);
+            const stornoNote = `Storno del movimento ${mov.id} del ${dataOrig}`;
             
-            for (const item of mov.items) {
-                if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
-                
-                if (mov.type === 'carico' && !mov.isDiretto) {
-                    // Era un carico normale, quindi togliamo i pack
-                    INVENTORY[DEFAULT_WAREHOUSE][item.code] -= item.qty;
-                } else if (mov.type === 'scarico' && !mov.fromCaricoDiretto) {
-                    // Era uno scarico normale, quindi rimettiamo i pack
+            if (mov.type === 'allineamento') {
+                // Storno di un allineamento: nuovo allineamento con segno opposto
+                const itemsStorno = mov.items.map(it => ({
+                    code: it.code,
+                    qty: -it.qty
+                }));
+                for (const item of itemsStorno) {
+                    if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
                     INVENTORY[DEFAULT_WAREHOUSE][item.code] += item.qty;
-                } else if (mov.type === 'allineamento') {
-                    // Era un allineamento, invertiamo la correzione
-                    INVENTORY[DEFAULT_WAREHOUSE][item.code] -= item.qty;
                 }
+                MOVEMENTS.unshift({
+                    id: 'MOV-' + Date.now(),
+                    type: 'allineamento',
+                    date: today,
+                    warehouse: DEFAULT_WAREHOUSE,
+                    warehouseName: WAREHOUSES[DEFAULT_WAREHOUSE]?.name || DEFAULT_WAREHOUSE,
+                    items: itemsStorno,
+                    totals: { packs: itemsStorno.reduce((s, it) => s + it.qty, 0) },
+                    note: stornoNote,
+                    stornoOf: mov.id,
+                    createdAt: new Date().toISOString()
+                });
+                
+            } else if (mov.type === 'scarico' && !mov.fromCaricoDiretto) {
+                // Storno di uno scarico normale: nuovo CARICO che ricrea i lotti consumati
+                let totalPacks = 0, totalCostoFabbrica = 0;
+                const itemsStorno = [];
+                
+                for (const item of mov.items) {
+                    if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
+                    INVENTORY[DEFAULT_WAREHOUSE][item.code] += item.qty;
+                    
+                    const prod = CAT[item.code];
+                    const pzPerPack = prod?.pz_per_pack || 1;
+                    
+                    // Calcola costo medio dei lotti originariamente consumati
+                    let costoMedioPz = 0;
+                    if (item.fifoConsumed && item.fifoConsumed.length > 0) {
+                        let pzTot = 0, costoTot = 0;
+                        for (const c of item.fifoConsumed) {
+                            const pz = c.qtyPacks * (c.pzPerPack || pzPerPack);
+                            pzTot += pz;
+                            costoTot += pz * c.costoPz;
+                        }
+                        costoMedioPz = pzTot > 0 ? costoTot / pzTot : 0;
+                    } else {
+                        costoMedioPz = prod?.precio_compra || 0;
+                    }
+                    
+                    totalPacks += item.qty;
+                    totalCostoFabbrica += item.qty * pzPerPack * costoMedioPz;
+                    
+                    itemsStorno.push({ code: item.code, qty: item.qty, costoPz: costoMedioPz });
+                }
+                
+                const stornoId = 'MOV-' + Date.now();
+                
+                // Ripristina i lotti FIFO consumati dal movimento originale
+                restoreFifoFromMovement(mov);
+                
+                const aiem = totalCostoFabbrica * 0.10;
+                MOVEMENTS.unshift({
+                    id: stornoId,
+                    type: 'carico',
+                    date: today,
+                    warehouse: DEFAULT_WAREHOUSE,
+                    warehouseName: WAREHOUSES[DEFAULT_WAREHOUSE]?.name || DEFAULT_WAREHOUSE,
+                    client: null,
+                    clientName: null,
+                    items: itemsStorno,
+                    totals: {
+                        packs: totalPacks,
+                        costoFabbrica: totalCostoFabbrica,
+                        aiem: aiem,
+                        costo: totalCostoFabbrica + aiem
+                    },
+                    isDiretto: false,
+                    note: stornoNote,
+                    stornoOf: mov.id,
+                    createdAt: new Date().toISOString()
+                });
+                
+            } else if (mov.type === 'carico' && !mov.isDiretto) {
+                // Storno di un carico normale: nuovo SCARICO ALLINEAMENTO che toglie i pack
+                // Usa un allineamento per non collegarlo a un cliente
+                const itemsStorno = mov.items.map(it => ({
+                    code: it.code,
+                    qty: -it.qty
+                }));
+                for (const item of itemsStorno) {
+                    if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
+                    INVENTORY[DEFAULT_WAREHOUSE][item.code] += item.qty;
+                }
+                // Rimuovi il lotto FIFO che il carico aveva creato (se ancora presente)
+                for (const item of mov.items) {
+                    if (!FIFO_STOCK[item.code]) continue;
+                    const idx = FIFO_STOCK[item.code].findIndex(l => l.movId === mov.id);
+                    if (idx !== -1) FIFO_STOCK[item.code].splice(idx, 1);
+                }
+                MOVEMENTS.unshift({
+                    id: 'MOV-' + Date.now(),
+                    type: 'allineamento',
+                    date: today,
+                    warehouse: DEFAULT_WAREHOUSE,
+                    warehouseName: WAREHOUSES[DEFAULT_WAREHOUSE]?.name || DEFAULT_WAREHOUSE,
+                    items: itemsStorno,
+                    totals: { packs: itemsStorno.reduce((s, it) => s + it.qty, 0) },
+                    note: stornoNote + ' (storno carico)',
+                    stornoOf: mov.id,
+                    createdAt: new Date().toISOString()
+                });
+                
+            } else if (mov.type === 'carico' && mov.isDiretto) {
+                // Storno di un carico diretto: il container non è mai passato dal magazzino,
+                // basta creare un movimento "informativo" di storno. Nessun impatto su FIFO/stock.
+                MOVEMENTS.unshift({
+                    id: 'MOV-' + Date.now(),
+                    type: 'allineamento',
+                    date: today,
+                    warehouse: DEFAULT_WAREHOUSE,
+                    warehouseName: WAREHOUSES[DEFAULT_WAREHOUSE]?.name || DEFAULT_WAREHOUSE,
+                    items: mov.items.map(it => ({ code: it.code, qty: 0 })),
+                    totals: { packs: 0 },
+                    note: stornoNote + ' (storno carico diretto - nessun impatto magazzino)',
+                    stornoOf: mov.id,
+                    createdAt: new Date().toISOString()
+                });
+                
+            } else if (mov.fromCaricoDiretto) {
+                // Storno di uno scarico generato da carico diretto: lo trattiamo come informativo
+                MOVEMENTS.unshift({
+                    id: 'MOV-' + Date.now(),
+                    type: 'allineamento',
+                    date: today,
+                    warehouse: DEFAULT_WAREHOUSE,
+                    warehouseName: WAREHOUSES[DEFAULT_WAREHOUSE]?.name || DEFAULT_WAREHOUSE,
+                    items: mov.items.map(it => ({ code: it.code, qty: 0 })),
+                    totals: { packs: 0 },
+                    note: stornoNote + ' (storno consegna container diretto)',
+                    stornoOf: mov.id,
+                    createdAt: new Date().toISOString()
+                });
             }
             
-            // Se è un carico diretto, elimina anche lo scarico associato
-            if (mov.isDiretto) {
-                const scaricoIndex = MOVEMENTS.findIndex(m => m.fromCaricoDiretto === mov.id);
-                if (scaricoIndex !== -1) {
-                    MOVEMENTS.splice(scaricoIndex, 1);
-                }
-            }
+            dataModified = true;
             
-            // Rimuovi movimento
-            MOVEMENTS.splice(movIndex, 1);
-            dataModified = true; autoSave();
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             renderMovements();
             renderStock();
             updateCharts();
             updateStatus();
+            refreshFifoIfVisible(); // v44
             
-            alert('✅ Movimento eliminato' + (!mov.isDiretto ? ' e stock ripristinato!' : '!'));
+            alert('✅ Movimento stornato! L\'originale resta visibile nello storico.');
         }
         
         function editMovement(movId) {
@@ -4479,6 +6609,21 @@
                     INVENTORY[DEFAULT_WAREHOUSE][item.code] += item.qty;
                 } else if (mov.type === 'allineamento') {
                     INVENTORY[DEFAULT_WAREHOUSE][item.code] -= item.qty;
+                }
+            }
+            
+            // v40: ripristina anche i lotti FIFO
+            if (mov.type === 'scarico' && !mov.fromCaricoDiretto) {
+                // Scarico normale: rimetti nei lotti i pack consumati
+                restoreFifoFromMovement(mov);
+            } else if (mov.type === 'carico' && !mov.isDiretto) {
+                // Carico normale: rimuovi il lotto FIFO che il carico aveva creato
+                for (const item of mov.items) {
+                    if (!FIFO_STOCK[item.code]) continue;
+                    const idx = FIFO_STOCK[item.code].findIndex(l => l.movId === mov.id);
+                    if (idx !== -1) {
+                        FIFO_STOCK[item.code].splice(idx, 1);
+                    }
                 }
             }
             
@@ -4602,7 +6747,7 @@
             }
         }
         
-        function saveEditedCarico() {
+        async function saveEditedCarico() {
             const date = document.getElementById('caricoDate').value;
             const note = document.getElementById('caricoNote').value.trim();
             const isDiretto = document.getElementById('caricoDestination').value === 'cliente';
@@ -4620,6 +6765,7 @@
             }
             
             const oldMov = MOVEMENTS[movIndex];
+            const lotto = document.getElementById('caricoLotto')?.value.trim() || '';
             
             // Applica nuovo stock (solo se non è diretto)
             if (!INVENTORY[DEFAULT_WAREHOUSE]) INVENTORY[DEFAULT_WAREHOUSE] = {};
@@ -4636,6 +6782,8 @@
                 if (!oldMov.isDiretto) {
                     if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
                     INVENTORY[DEFAULT_WAREHOUSE][item.code] += item.qty;
+                    // v40: ricrea il lotto FIFO (era stato rimosso in editMovement)
+                    fifoAddLot(item.code, item.qty, item.costoPz || 0, date, oldMov.id, lotto);
                 }
                 
                 if (isDiretto) {
@@ -4692,15 +6840,19 @@
             renderCaricoItems();
             updateCaricoButton(false);
             updateStatus();
-            dataModified = true; autoSave();
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             alert('✅ Carico modificato!');
             showMagSubpanelDirect('storico');
             renderMovements();
             updateCharts();
+            refreshFifoIfVisible(); // v44
         }
         
-        function saveEditedScarico() {
+        async function saveEditedScarico() {
             const date = document.getElementById('scaricoDate').value;
             const clientId = getScaricoClientValue();
             const note = document.getElementById('scaricoNote').value.trim();
@@ -4717,19 +6869,29 @@
                 return;
             }
             
-            // Applica nuovo stock e calcola totali
+            // Applica nuovo stock e calcola totali con FIFO corretto
+            // Nota: l'inventario aggregato è già stato ripristinato in editMovement;
+            // il ripristino dei lotti FIFO viene fatto in editMovement (v40).
             if (!INVENTORY[DEFAULT_WAREHOUSE]) INVENTORY[DEFAULT_WAREHOUSE] = {};
             let totalPacks = 0, totalVendita = 0, totalCostoFabbrica = 0;
             
             for (const item of scaricoItems) {
-                if (!INVENTORY[DEFAULT_WAREHOUSE][item.code]) INVENTORY[DEFAULT_WAREHOUSE][item.code] = 0;
+                // Verifica disponibilità stock (con i lotti FIFO ripristinati)
+                const available = INVENTORY[DEFAULT_WAREHOUSE][item.code] || 0;
+                if (available < item.qty) {
+                    const prod = CAT[item.code];
+                    alert(`⚠️ Stock insufficiente!\n\n${prod?.descripcion || item.code}\nDisponibili: ${available} pack\nRichiesti: ${item.qty} pack`);
+                    return;
+                }
+                
                 INVENTORY[DEFAULT_WAREHOUSE][item.code] -= item.qty;
                 totalPacks += item.qty;
-                
-                const prod = CAT[item.code];
-                const pieces = item.qty * (prod?.pz_per_pack || 1);
                 totalVendita += item.qty * item.price;
-                totalCostoFabbrica += pieces * (prod?.precio_compra || 0);
+                
+                // v40: usa costo FIFO (non più precio_compra del catalogo) e salva tracking
+                const fifo = getFifoCost(item.code, item.qty);
+                totalCostoFabbrica += fifo.costoFabbrica;
+                item.fifoConsumed = consumeFifo(item.code, item.qty);
             }
             
             const aiem = totalCostoFabbrica * 0.10;
@@ -4761,15 +6923,19 @@
             renderScaricoItems();
             updateScaricoButton(false);
             updateStatus();
-            dataModified = true; autoSave();
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             alert('✅ Consegna modificata!');
             showMagSubpanelDirect('storico');
             renderMovements();
             updateCharts();
+            refreshFifoIfVisible(); // v44
         }
         
-        function saveEditedAllineamento() {
+        async function saveEditedAllineamento() {
             const date = document.getElementById('allineamentoDate').value;
             const note = document.getElementById('allineamentoNote').value.trim();
             
@@ -4811,7 +6977,10 @@
             renderAllineamentoItems();
             updateAllineamentoButton(false);
             updateStatus();
-            dataModified = true; autoSave();
+            dataModified = true;
+            
+            // v34: sincronizza il magazzino sul cloud
+            await syncWarehouseToCloud();
             
             alert('✅ Allineamento modificato!');
             showMagSubpanelDirect('storico');
@@ -5694,14 +7863,33 @@
         }
         
         // Salva in archivio
-        function calcSaveToArchive() {
+        async function calcSaveToArchive() {
             if (!calcCurrentCalculation) {
                 alert('⚠️ Nessun calcolo da salvare!');
                 return;
             }
             
+            // v37: aggiungo ID univoco e timestamp per Firebase
+            calcCurrentCalculation._id = 'price_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            calcCurrentCalculation._createdAt = Date.now();
+            
             calcPriceArchive.unshift(calcCurrentCalculation);
-            localStorage.setItem('mediaPizzaPriceArchive', JSON.stringify(calcPriceArchive));
+            
+            // Cache locale (utile in caso di offline)
+            try {
+                localStorage.setItem('mediaPizzaPriceArchive', JSON.stringify(calcPriceArchive));
+            } catch (e) {}
+            
+            // Sync Firebase
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Salvataggio prezzo...');
+                    await window.firebaseSync.savePriceItem(calcCurrentCalculation);
+                    // Lo stato 'synced' sarà ripristinato dal listener real-time
+                }
+            } catch (err) {
+                alert('⚠️ Prezzo salvato in locale ma errore sul cloud: ' + err.message);
+            }
             
             calcLoadArchive();
             calcResetForm();
@@ -5771,22 +7959,54 @@
         }
         
         // Elimina elemento
-        function calcDeleteItem(index) {
-            if (confirm('Sei sicuro di voler eliminare questo prodotto?')) {
-                calcPriceArchive.splice(index, 1);
+        async function calcDeleteItem(index) {
+            if (!confirm('Sei sicuro di voler eliminare questo prodotto?')) return;
+            
+            const item = calcPriceArchive[index];
+            if (!item) return;
+            
+            calcPriceArchive.splice(index, 1);
+            
+            try {
                 localStorage.setItem('mediaPizzaPriceArchive', JSON.stringify(calcPriceArchive));
-                calcLoadArchive();
+            } catch (e) {}
+            
+            // Sync Firebase
+            if (item._id) {
+                try {
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        setSyncStatus('syncing', 'Eliminazione prezzo...');
+                        await window.firebaseSync.deletePriceItem(item._id);
+                    }
+                } catch (err) {
+                    alert('⚠️ Prezzo eliminato in locale ma errore sul cloud: ' + err.message);
+                }
             }
+            
+            calcLoadArchive();
         }
         
         // Svuota archivio
-        function calcClearArchive() {
-            if (confirm('Sei sicuro di voler svuotare completamente l\'archivio prezzi?')) {
-                calcPriceArchive = [];
+        async function calcClearArchive() {
+            if (!confirm('Sei sicuro di voler svuotare completamente l\'archivio prezzi?')) return;
+            
+            calcPriceArchive = [];
+            try {
                 localStorage.removeItem('mediaPizzaPriceArchive');
-                calcLoadArchive();
-                alert('🗑️ Archivio prezzi svuotato!');
+            } catch (e) {}
+            
+            // Sync Firebase: cancella tutti i price item
+            try {
+                if (window.firebaseSync && window.firebaseSync.ready) {
+                    setSyncStatus('syncing', 'Svuotamento archivio prezzi...');
+                    await window.firebaseSync.clearAllPriceArchive();
+                }
+            } catch (err) {
+                alert('⚠️ Archivio svuotato in locale ma errore sul cloud: ' + err.message);
             }
+            
+            calcLoadArchive();
+            alert('🗑️ Archivio prezzi svuotato!');
         }
         
         // Esporta Excel
@@ -5885,7 +8105,7 @@
             console.log('File selezionato:', file.name);
             
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 console.log('File letto, elaborazione...');
                 try {
                     const data = new Uint8Array(e.target.result);
@@ -5899,6 +8119,7 @@
                     
                     let updated = 0;
                     let added = 0;
+                    const modifiedCodes = [];
                     
                     jsonData.forEach(row => {
                         const id = row['ID'];
@@ -5916,10 +8137,8 @@
                             pz_per_pack: parseInt(row['Pz/Pack']) || 100
                         };
                         
-                        console.log('Elaboro prodotto:', id, productData);
-                        
                         if (CAT[id]) {
-                            // Aggiorna prodotto esistente (mantieni eventuali altri campi)
+                            // Aggiorna prodotto esistente (mantieni eventuali altri campi, es. clientRefs)
                             CAT[id] = { ...CAT[id], ...productData };
                             updated++;
                         } else {
@@ -5927,15 +8146,42 @@
                             CAT[id] = productData;
                             added++;
                         }
+                        modifiedCodes.push(id);
                     });
                     
-                    dataModified = true; autoSave();
+                    dataModified = true;
+                    migrateCatalogClientRefs(); // v41
+                    
+                    // v45 (V5): salva i prodotti modificati sul cloud, altrimenti il listener
+                    // Firebase rimette la versione vecchia e i nuovi prezzi vengono persi.
+                    let cloudSaved = 0, cloudErrors = 0;
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        setSyncStatus('syncing', 'Salvataggio prezzi sul cloud...');
+                        for (const code of modifiedCodes) {
+                            try {
+                                await window.firebaseSync.saveCatalogItem(code, CAT[code]);
+                                cloudSaved++;
+                            } catch (err) {
+                                cloudErrors++;
+                                console.warn('Errore salvataggio cloud prodotto ' + code + ':', err);
+                            }
+                        }
+                        setSyncStatus('synced');
+                    }
+                    
                     renderProductsList();
                     updateProductList();
                     updateStatus();
                     
-                    console.log('Importazione completata:', added, 'aggiunti,', updated, 'aggiornati');
-                    alert(`✅ Importazione completata!\n\n${added} prodotti aggiunti\n${updated} prodotti aggiornati`);
+                    console.log('Importazione completata:', added, 'aggiunti,', updated, 'aggiornati,', cloudSaved, 'salvati sul cloud');
+                    let msg = `✅ Importazione completata!\n\n${added} prodotti aggiunti\n${updated} prodotti aggiornati`;
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        msg += `\n${cloudSaved} salvati sul cloud`;
+                        if (cloudErrors > 0) msg += `\n⚠️ ${cloudErrors} errori di salvataggio (vedi console)`;
+                    } else {
+                        msg += `\n\n⚠️ Firebase non disponibile: modifiche salvate solo in locale.`;
+                    }
+                    alert(msg);
                 } catch (err) {
                     console.error('Errore import:', err);
                     alert('❌ Errore nella lettura del file: ' + err.message);
@@ -5983,7 +8229,7 @@
             if (!file) return;
             
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const data = new Uint8Array(e.target.result);
                     const workbook = XLSX.read(data, { type: 'array' });
@@ -5993,6 +8239,7 @@
                     
                     let updated = 0;
                     let added = 0;
+                    const modifiedIds = [];
                     
                     jsonData.forEach(row => {
                         const id = row['ID'];
@@ -6004,22 +8251,46 @@
                         };
                         
                         if (CLIENTS[id]) {
-                            // Aggiorna cliente esistente
                             CLIENTS[id] = clientData;
                             updated++;
                         } else {
-                            // Nuovo cliente
                             CLIENTS[id] = clientData;
                             added++;
                         }
+                        modifiedIds.push(id);
                     });
                     
-                    dataModified = true; autoSave();
+                    dataModified = true;
+                    
+                    // v45 (V5): salva i clienti modificati sul cloud, altrimenti il listener
+                    // Firebase rimette la versione vecchia.
+                    let cloudSaved = 0, cloudErrors = 0;
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        setSyncStatus('syncing', 'Salvataggio clienti sul cloud...');
+                        for (const id of modifiedIds) {
+                            try {
+                                await window.firebaseSync.saveClient(id, CLIENTS[id]);
+                                cloudSaved++;
+                            } catch (err) {
+                                cloudErrors++;
+                                console.warn('Errore salvataggio cloud cliente ' + id + ':', err);
+                            }
+                        }
+                        setSyncStatus('synced');
+                    }
+                    
                     renderClientsList();
                     renderClientRadios();
                     updateStatus();
                     
-                    alert(`✅ Importazione completata!\n\n${added} clienti aggiunti\n${updated} clienti aggiornati`);
+                    let msg = `✅ Importazione completata!\n\n${added} clienti aggiunti\n${updated} clienti aggiornati`;
+                    if (window.firebaseSync && window.firebaseSync.ready) {
+                        msg += `\n${cloudSaved} salvati sul cloud`;
+                        if (cloudErrors > 0) msg += `\n⚠️ ${cloudErrors} errori (vedi console)`;
+                    } else {
+                        msg += `\n\n⚠️ Firebase non disponibile: modifiche salvate solo in locale.`;
+                    }
+                    alert(msg);
                 } catch (err) {
                     alert('❌ Errore nella lettura del file: ' + err.message);
                 }
@@ -6029,5 +8300,41 @@
         }
         
     </script>
+    <!-- v42 (Bug H): modale scelta destinazione carico ordine -->
+    <div id="caricoChoiceModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 12px; padding: 28px; max-width: 460px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,0.3);">
+            <h3 style="margin: 0 0 8px 0; color: #333;">📥 Dove registrare il carico?</h3>
+            <p id="caricoChoiceText" style="color: #666; font-size: 14px; margin: 0 0 22px 0;"></p>
+            <div style="display: flex; gap: 12px;">
+                <button id="caricoChoiceCliente" class="btn btn-primary" style="flex: 1; padding: 16px; font-size: 15px;">
+                    👤 Cliente<br><span style="font-size: 11px; font-weight: normal; opacity: 0.9;">Consegna diretta</span>
+                </button>
+                <button id="caricoChoiceMediapizza" class="btn btn-warning" style="flex: 1; padding: 16px; font-size: 15px;">
+                    🏭 Mediapizza<br><span style="font-size: 11px; font-weight: normal; opacity: 0.9;">Entra in magazzino</span>
+                </button>
+            </div>
+            <div style="text-align: center; margin-top: 16px;">
+                <button id="caricoChoiceAnnulla" class="btn btn-secondary btn-sm">Annulla</button>
+            </div>
+        </div>
+    </div>
+    <!-- v45 (G15): modale scelta eliminazione cliente con prodotti associati -->
+    <div id="deleteClientModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 12px; padding: 28px; max-width: 500px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,0.3);">
+            <h3 style="margin: 0 0 8px 0; color: #333;">🗑️ Eliminare il cliente?</h3>
+            <p id="deleteClientText" style="color: #666; font-size: 14px; margin: 0 0 22px 0;"></p>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+                <button id="deleteClientGeneric" class="btn btn-primary" style="padding: 14px; font-size: 14px; text-align: left;">
+                    📦 Rendi generici i prodotti<br><span style="font-size: 11px; font-weight: normal; opacity: 0.9;">I prodotti restano nel catalogo, disponibili per tutti</span>
+                </button>
+                <button id="deleteClientProducts" class="btn btn-danger" style="padding: 14px; font-size: 14px; text-align: left;">
+                    🗑️ Elimina i prodotti esclusivi<br><span style="font-size: 11px; font-weight: normal; opacity: 0.9;">I prodotti solo di questo cliente vengono cancellati</span>
+                </button>
+            </div>
+            <div style="text-align: center; margin-top: 16px;">
+                <button id="deleteClientCancel" class="btn btn-secondary btn-sm">Annulla</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
