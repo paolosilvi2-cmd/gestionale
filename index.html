@@ -1453,12 +1453,26 @@
                             </select>
                             <input type="number" id="discountPct" min="0.1" max="99" step="0.1" value="7" style="width: 80px; font-size: 13px; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px;">
                             <span style="font-size: 13px; color: #555;">%</span>
-                            <button class="btn btn-warning" onclick="applyGlobalDiscount()" style="font-size: 13px;">✅ Applica a tutti i prodotti</button>
+                            <button class="btn btn-warning" onclick="applyGlobalDiscount()" style="font-size: 13px;" id="applyDiscountBtn">✅ Applica a tutti i prodotti</button>
                             <button class="btn btn-secondary" onclick="invertLastPriceChange()" id="invertBtn" style="font-size: 13px;" disabled>↩️ Inverti ultima modifica</button>
                         </div>
-                        <div id="lastPriceChangeInfo" style="font-size: 11px; color: #856404; margin-top: 6px;">⚠️ Modifica permanente al costo €/pezzo di tutti i prodotti in catalogo. Esporta prima un backup.</div>
+                        <div id="discountScopeInfo" style="font-size: 12px; color: #856404; margin-top: 8px; font-weight: bold;"></div>
+                        <div id="lastPriceChangeInfo" style="font-size: 11px; color: #856404; margin-top: 6px;">⚠️ Modifica permanente al costo €/pezzo. Esporta prima un backup.</div>
                     </div>
-                    <div id="productsList" style="max-height: 400px; overflow-y: auto;">
+                    <!-- v48: barra filtri catalogo -->
+                    <div style="background:#f1f5f9; border:1px solid #cbd5e1; border-radius:8px; padding:12px; margin-bottom:12px;">
+                        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                            <input type="text" id="prodFilterText" placeholder="🔍 Cerca per codice, descrizione, qualità o ref. cliente"
+                                   oninput="applyProductFilter()" style="flex:1; min-width:220px; padding:7px 10px; border:1px solid #ccc; border-radius:5px; font-size:13px;">
+                            <select id="prodFilterClient" onchange="applyProductFilter()"
+                                    style="padding:7px 10px; border:1px solid #ccc; border-radius:5px; font-size:13px; min-width:150px;">
+                                <option value="">Tutti i clienti</option>
+                            </select>
+                            <button class="btn btn-secondary btn-sm" onclick="resetProductFilter()">✖️ Azzera</button>
+                        </div>
+                        <div id="prodFilterCount" style="font-size:12px; color:#475569; margin-top:8px;"></div>
+                    </div>
+                    <div id="productsList" style="max-height: 500px; overflow-y: auto;">
                         <!-- Popolato dinamicamente -->
                     </div>
                     <hr style="margin: 15px 0;">
@@ -1498,9 +1512,22 @@
                             <input type="number" id="newProdPriceA" step="0.0001" placeholder="0.1240">
                         </div>
                         <div class="form-group">
-                            <label>Pz/Pack</label>
-                            <input type="number" id="newProdPzPack" value="100">
+                            <label>Pz per unità (auto)</label>
+                            <input type="number" id="newProdPzPack" value="100" readonly style="background:#eee; color:#666;">
                         </div>
+                    </div>
+                    <!-- v48: IMBALLO A LIVELLI LIBERI -->
+                    <div class="form-group" style="border:1px solid #ddd; border-radius:8px; padding:12px; background:#fafafa;">
+                        <label style="font-weight:bold;">📦 Imballo</label>
+                        <p style="font-size:11px; color:#666; margin:4px 0 10px;">
+                            Ogni riga dice quanti elementi del livello precedente contiene, dal più piccolo al pallet.
+                            Il pallino ⦿ indica l'unità a cui è riferito il <strong>prezzo di vendita</strong>.
+                        </p>
+                        <div id="prodPackagingRows"></div>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="addPackagingLevel()" style="margin-top:5px;">➕ Aggiungi livello</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="applyPackagingPreset('scatole')" style="margin-top:5px;">🍕 Scatole</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="applyPackagingPreset('sfuso')" style="margin-top:5px;">📄 Sfuso a pallet</button>
+                        <div id="prodPackagingSummary" style="margin-top:10px; font-size:12px; color:#333; background:#fff; border-radius:6px; padding:8px;"></div>
                     </div>
                     <div class="form-group">
                         <label>Immagine</label>
@@ -2354,6 +2381,7 @@
         
         function initApp() {
             updateStatus();
+            if (typeof renderProdPackaging === 'function') renderProdPackaging(); // v48
             renderClientRadios();
             updateProductList();
             updateWarehouseList();
@@ -2618,7 +2646,7 @@
                 lastPriceChange: lastPriceChange,
                 priceArchive: calcPriceArchive,
                 exportDate: new Date().toISOString(),
-                version: '5.3-v47-toggle-evaso-manuale'
+                version: '5.3-v49-filtro-catalogo'
             };
             
             const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
@@ -3334,17 +3362,140 @@
                 document.getElementById('previewCode').textContent = `Codice: ${code}`;
             }
             document.getElementById('previewQuality').textContent = `Qualità: ${product.qualita || 'N/A'}`;
-            document.getElementById('previewPrice').textContent = `€${product.precio_venta}/pack (${product.pz_per_pack} pz)`;
+            const _u = getUnitName(code); // v48
+            document.getElementById('previewPrice').textContent = `€${product.precio_venta}/${_u} (${product.pz_per_pack} pz)`;
+            updateQtyTypeOptions(code); // v48: menu quantita' su misura del prodotto
             
             preview.style.display = 'flex';
         }
         
+        // v48: il menu "Quantita' per" mostra i livelli veri del prodotto scelto
+        function updateQtyTypeOptions(code) {
+            const sel = document.getElementById('qtyType');
+            if (!sel) return;
+            const pk = getProductPackaging(code);
+            const prev = sel.value;
+            const palletName = pk ? pk.palletName : 'Pallet';
+            const unitName = pk ? pk.unitName : 'Pack';
+            
+            let html = `<option value="pallet">${palletName}</option>`;
+            if (!pk || (!pk.soldByPiece && unitName !== palletName)) {
+                html += `<option value="pack">${unitName}</option>`;
+            }
+            html += '<option value="pezzi">Pezzi</option>';
+            sel.innerHTML = html;
+            
+            const still = Array.from(sel.options).some(o => o.value === prev);
+            sel.value = still ? prev : 'pallet';
+        }
+        
+        // =====================================
+        // v48: FILTRO CATALOGO PRODOTTI
+        // =====================================
+        
+        function getProductFilterState() {
+            const t = (document.getElementById('prodFilterText')?.value || '').trim().toLowerCase();
+            const c = document.getElementById('prodFilterClient')?.value || '';
+            return { text: t, clientId: c, active: !!(t || c) };
+        }
+        
+        // Restituisce le voci di catalogo che passano il filtro corrente
+        function getFilteredProducts() {
+            const f = getProductFilterState();
+            let entries = Object.entries(CAT);
+            
+            if (f.clientId) {
+                entries = entries.filter(([code, prod]) => {
+                    const list = getProductClientList(prod);
+                    if (f.clientId === '__generic__') return list.length === 0;
+                    return list.some(c => c.clientId === f.clientId);
+                });
+            }
+            
+            if (f.text) {
+                entries = entries.filter(([code, prod]) => {
+                    const refs = getProductClientList(prod).map(c => `${c.clientName} ${c.ref}`).join(' ');
+                    const blob = `${code} ${prod.descripcion || ''} ${prod.qualita || ''} ${refs}`.toLowerCase();
+                    return blob.includes(f.text);
+                });
+            }
+            
+            return entries;
+        }
+        
+        function applyProductFilter() {
+            renderProductsList();
+        }
+        
+        function resetProductFilter() {
+            const t = document.getElementById('prodFilterText');
+            const c = document.getElementById('prodFilterClient');
+            if (t) t.value = '';
+            if (c) c.value = '';
+            renderProductsList();
+        }
+        
+        // Popola la tendina clienti mantenendo la selezione corrente
+        function updateProductFilterClientSelect() {
+            const sel = document.getElementById('prodFilterClient');
+            if (!sel) return;
+            const prev = sel.value;
+            let html = '<option value="">Tutti i clienti</option>';
+            const clients = Object.entries(CLIENTS).sort((a, b) =>
+                (a[1].name || a[0]).localeCompare(b[1].name || b[0]));
+            for (const [cid, cl] of clients) {
+                html += `<option value="${cid}">${cl.name || cid}</option>`;
+            }
+            html += '<option value="__generic__">— Senza cliente (generico) —</option>';
+            sel.innerHTML = html;
+            if (Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
+        }
+        
+        // Aggiorna il pulsante dello sconto in base al filtro attivo
+        function updateDiscountScopeUI(nFiltrati, nTotali) {
+            const btn = document.getElementById('applyDiscountBtn');
+            const info = document.getElementById('discountScopeInfo');
+            const f = getProductFilterState();
+            if (!btn || !info) return;
+            
+            if (f.active) {
+                btn.textContent = `✅ Applica ai ${nFiltrati} prodotti filtrati`;
+                btn.style.background = '#DC143C';
+                info.innerHTML = `🎯 Il filtro è attivo: la modifica colpirà SOLO i ${nFiltrati} prodotti elencati qui sotto (su ${nTotali} in catalogo).`;
+                info.style.color = '#b91c1c';
+            } else {
+                btn.textContent = `✅ Applica a tutti i ${nTotali} prodotti`;
+                btn.style.background = '';
+                info.innerHTML = `🌐 Nessun filtro attivo: la modifica colpirà TUTTI i ${nTotali} prodotti del catalogo. Usa i filtri qui sotto per limitarla a una selezione.`;
+                info.style.color = '#856404';
+            }
+        }
+        
         function renderProductsList() {
             const container = document.getElementById('productsList');
-            const products = Object.entries(CAT);
+            const totali = Object.keys(CAT).length;
+            
+            updateProductFilterClientSelect();
+            
+            const products = getFilteredProducts();
+            const f = getProductFilterState();
+            
+            updateDiscountScopeUI(products.length, totali);
+            
+            const countBox = document.getElementById('prodFilterCount');
+            if (countBox) {
+                countBox.innerHTML = f.active
+                    ? `Mostrati <strong>${products.length}</strong> prodotti su ${totali}`
+                    : `<strong>${totali}</strong> prodotti in catalogo`;
+            }
+            
+            if (totali === 0) {
+                container.innerHTML = '<p style="color: #999; text-align: center;">Nessun prodotto.</p>';
+                return;
+            }
             
             if (products.length === 0) {
-                container.innerHTML = '<p style="color: #999; text-align: center;">Nessun prodotto.</p>';
+                container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">Nessun prodotto corrisponde al filtro.</p>';
                 return;
             }
             
@@ -3387,6 +3538,7 @@
             document.getElementById('newProdPriceS').value = product.precio_venta;
             document.getElementById('newProdPriceA').value = product.precio_compra;
             document.getElementById('newProdPzPack').value = product.pz_per_pack;
+            loadProdPackagingFrom(product); // v48: imballo
             // v41: clienti associati
             loadNewProdClientRefsFrom(product);
             
@@ -3491,6 +3643,7 @@
             document.getElementById('newProdPriceS').value = product.precio_venta;
             document.getElementById('newProdPriceA').value = product.precio_compra;
             document.getElementById('newProdPzPack').value = product.pz_per_pack;
+            loadProdPackagingFrom(product); // v48: imballo
             // v41: clienti associati
             loadNewProdClientRefsFrom(product);
             
@@ -3527,34 +3680,46 @@
                 return;
             }
             
-            const nProdotti = Object.keys(CAT).length;
+            // v48: opera SOLO sui prodotti attualmente filtrati
+            const filtro = getProductFilterState();
+            const targetCodes = getFilteredProducts().map(([code]) => code);
+            const nProdotti = targetCodes.length;
+            
             if (nProdotti === 0) {
-                alert('Nessun prodotto in catalogo');
+                alert('Nessun prodotto da modificare (controlla il filtro).');
                 return;
             }
             
-            const nOrdini = savedOrders.length;
+            const codeSet = new Set(targetCodes);
+            const nOrdini = savedOrders.filter(o => o.items.some(i => codeSet.has(i.code))).length;
             const label = type === 'discount' ? `sconto del ${pct}%` : `aumento del ${pct}%`;
-            if (!confirm(`Applicare un ${label} al costo di acquisto di:\n• ${nProdotti} prodotti in catalogo\n• ${nOrdini} ordini in archivio\n\nQuesta operazione è permanente. Assicurati di aver esportato un backup prima di procedere.`)) return;
+            
+            const scopeTxt = filtro.active
+                ? `⚠️ FILTRO ATTIVO — la modifica riguarda SOLO questi ${nProdotti} prodotti:\n${targetCodes.slice(0, 12).join(', ')}${targetCodes.length > 12 ? ' … (+' + (targetCodes.length - 12) + ')' : ''}`
+                : `🌐 NESSUN FILTRO — la modifica riguarda TUTTI i ${nProdotti} prodotti del catalogo.`;
+            
+            if (!confirm(`Applicare un ${label} al costo di acquisto?\n\n${scopeTxt}\n\n• ${nOrdini} ordini in archivio verranno ricalcolati\n\nQuesta operazione è permanente. Assicurati di aver esportato un backup prima di procedere.`)) return;
             
             const multiplier = type === 'discount' ? (1 - pct / 100) : (1 + pct / 100);
             
-            // Aggiorna catalogo
-            for (const code in CAT) {
+            // Aggiorna catalogo (solo i codici selezionati)
+            for (const code of targetCodes) {
+                if (!CAT[code]) continue;
                 CAT[code].precio_compra = Math.round(CAT[code].precio_compra * multiplier * 100000) / 100000;
             }
             
             // Aggiorna ordini in archivio
             for (const order of savedOrders) {
-                // Ricalcola costPerPiece di ogni item
+                // Ricalcola costPerPiece solo degli item coinvolti
                 for (const item of order.items) {
+                    if (!codeSet.has(item.code)) continue;
                     item.costPerPiece = Math.round(item.costPerPiece * multiplier * 100000) / 100000;
                 }
                 
                 // Ricalcola i totali dell'ordine
                 let totalPacks = 0, totalPieces = 0, totalListino = 0, totalCost = 0;
                 for (const item of order.items) {
-                    const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                    const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                     const packs = item.pallets * pkPerPallet;
                     const pieces = packs * item.pzPerPack;
                     totalPacks += packs;
@@ -3584,7 +3749,14 @@
             renderArchive();
             
             // Salva l'ultima modifica per poterla invertire
-            lastPriceChange = { type, pct, multiplier, date: new Date().toISOString().slice(0,10) };
+            // v48: memorizza ANCHE i codici colpiti, cosi' l'inversione agisce
+            // esattamente sugli stessi prodotti anche se cambi filtro
+            lastPriceChange = {
+                type, pct, multiplier,
+                date: new Date().toISOString().slice(0,10),
+                codes: targetCodes,
+                scoped: filtro.active
+            };
             updateLastPriceChangeUI();
             
             alert(`✅ ${label.charAt(0).toUpperCase() + label.slice(1)} applicato a ${nProdotti} prodotti e ${nOrdini} ordini in archivio.\n\n⚠️ Ricorda di esportare i dati!`);
@@ -3602,8 +3774,12 @@
                 const inversePct = Math.abs((1 / multiplier - 1) * 100);
                 const inverseType = type === 'discount' ? 'aumento' : 'sconto';
                 btn.disabled = false;
+                const nCodes = Array.isArray(lastPriceChange.codes) ? lastPriceChange.codes.length : 0;
+                const scope = lastPriceChange.scoped
+                    ? ` su <strong>${nCodes} prodotti selezionati</strong>`
+                    : ' su tutto il catalogo';
                 info.innerHTML = `⚠️ Modifica permanente. Esporta prima un backup.<br>
-                    <span style="color: #5a3e00;">📌 Ultima modifica: <strong>${label}</strong> del ${date} — 
+                    <span style="color: #5a3e00;">📌 Ultima modifica: <strong>${label}</strong> del ${date}${scope} — 
                     Per invertirla serve un <strong>${inverseType} del ${inversePct.toFixed(4)}%</strong></span>`;
             } else {
                 btn.disabled = true;
@@ -3624,23 +3800,35 @@
             const inversePct = Math.abs((inverseMultiplier - 1) * 100);
             const inverseType = type === 'discount' ? 'aumento' : 'sconto';
             
-            const nProdotti = Object.keys(CAT).length;
-            const nOrdini = savedOrders.length;
+            // v48: inverte esattamente sugli stessi prodotti della modifica originale,
+            // indipendentemente dal filtro attivo adesso. Se la modifica e' vecchia
+            // (senza elenco codici) si comporta come prima: tutto il catalogo.
+            const targetCodes = Array.isArray(lastPriceChange.codes) && lastPriceChange.codes.length
+                ? lastPriceChange.codes
+                : Object.keys(CAT);
+            const codeSet = new Set(targetCodes);
+            const nProdotti = targetCodes.length;
+            const nOrdini = savedOrders.filter(o => o.items.some(i => codeSet.has(i.code))).length;
+            const scopeTxt = lastPriceChange.scoped
+                ? `su una SELEZIONE di ${nProdotti} prodotti`
+                : `su tutti i ${nProdotti} prodotti`;
             
-            if (!confirm(`Invertire l'ultima modifica (${label} del ${date})?\n\nVerrà applicato un ${inverseType} esatto del ${inversePct.toFixed(4)}% a:\n• ${nProdotti} prodotti in catalogo\n• ${nOrdini} ordini in archivio\n\nI prezzi torneranno esattamente ai valori precedenti la modifica.`)) return;
+            if (!confirm(`Invertire l'ultima modifica (${label} del ${date}, applicato ${scopeTxt})?\n\nVerrà applicato un ${inverseType} esatto del ${inversePct.toFixed(4)}% a:\n• ${nProdotti} prodotti\n• ${nOrdini} ordini in archivio\n\nI prezzi torneranno esattamente ai valori precedenti la modifica.`)) return;
             
             // Applica il moltiplicatore inverso
-            for (const code in CAT) {
+            for (const code of targetCodes) {
+                if (!CAT[code]) continue;
                 CAT[code].precio_compra = Math.round(CAT[code].precio_compra * inverseMultiplier * 100000) / 100000;
             }
             
             for (const order of savedOrders) {
                 for (const item of order.items) {
+                    if (!codeSet.has(item.code)) continue;
                     item.costPerPiece = Math.round(item.costPerPiece * inverseMultiplier * 100000) / 100000;
                 }
                 let totalPacks = 0, totalPieces = 0, totalListino = 0, totalCost = 0;
                 for (const item of order.items) {
-                    const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                    const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                     const packs = item.pallets * pkPerPallet;
                     const pieces = packs * item.pzPerPack;
                     totalPacks += packs;
@@ -3748,13 +3936,148 @@
             return result;
         }
         
+        // =====================================
+        // v48: EDITOR IMBALLO NEL FORM PRODOTTO
+        // =====================================
+        
+        let _prodPackaging = defaultPackaging();
+        
+        function defaultPackaging() {
+            return { levels: [{ name: 'Pack', qty: 100 }, { name: 'Pallet', qty: 45 }], saleIdx: 0 };
+        }
+        
+        function applyPackagingPreset(kind) {
+            if (kind === 'scatole') {
+                _prodPackaging = defaultPackaging();
+            } else if (kind === 'sfuso') {
+                // prodotto non impacchettato, venduto a pezzo, X pezzi per pallet
+                _prodPackaging = { levels: [{ name: 'Pallet', qty: 475 }], saleIdx: -1 };
+            }
+            renderProdPackaging();
+        }
+        
+        function addPackagingLevel() {
+            _prodPackaging.levels.push({ name: 'Nuovo livello', qty: 1 });
+            renderProdPackaging();
+        }
+        
+        function removePackagingLevel(i) {
+            if (_prodPackaging.levels.length <= 1) {
+                alert('Deve restare almeno un livello (il pallet).');
+                return;
+            }
+            _prodPackaging.levels.splice(i, 1);
+            if (_prodPackaging.saleIdx >= _prodPackaging.levels.length) {
+                _prodPackaging.saleIdx = _prodPackaging.levels.length - 1;
+            }
+            renderProdPackaging();
+        }
+        
+        function setProdSaleLevel(i) {
+            _prodPackaging.saleIdx = i;
+            renderProdPackaging();
+        }
+        
+        function updatePackagingLevel(i, field, value) {
+            if (!_prodPackaging.levels[i]) return;
+            if (field === 'qty') {
+                _prodPackaging.levels[i].qty = parseInt(value) || 1;
+            } else {
+                _prodPackaging.levels[i].name = value;
+            }
+            updatePackagingSummary();
+        }
+        
+        function renderProdPackaging() {
+            const c = document.getElementById('prodPackagingRows');
+            if (!c) return;
+            const lv = _prodPackaging.levels;
+            
+            let html = `
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                    <input type="radio" name="prodSaleLevel" ${_prodPackaging.saleIdx === -1 ? 'checked' : ''} onchange="setProdSaleLevel(-1)" title="Prezzo riferito al pezzo" style="width:18px; height:18px; min-width:18px; flex-shrink:0; margin:0; padding:0; accent-color:#DC143C; cursor:pointer;">
+                    <span style="font-size:13px; color:${_prodPackaging.saleIdx === -1 ? '#DC143C' : '#666'}; font-weight:${_prodPackaging.saleIdx === -1 ? 'bold' : 'normal'};">Pezzo <small style="font-weight:normal; color:#999;">(unità base)</small></span>
+                </div>
+            `;
+            
+            for (let i = 0; i < lv.length; i++) {
+                const sotto = (i === 0) ? 'pezzi' : (lv[i - 1].name || 'unità');
+                html += `
+                    <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px; flex-wrap:wrap;">
+                        <input type="radio" name="prodSaleLevel" ${_prodPackaging.saleIdx === i ? 'checked' : ''} onchange="setProdSaleLevel(${i})" title="Prezzo riferito a questo livello" style="width:18px; height:18px; min-width:18px; flex-shrink:0; margin:0; padding:0; accent-color:#DC143C; cursor:pointer;">
+                        <input type="text" value="${(lv[i].name || '').replace(/"/g, '&quot;')}" placeholder="Nome livello"
+                               style="flex:1; min-width:80px; width:auto; padding:5px;" oninput="updatePackagingLevel(${i},'name',this.value)" onblur="renderProdPackaging()">
+                        <span style="font-size:12px; color:#666; white-space:nowrap;">contiene</span>
+                        <input type="number" min="1" value="${lv[i].qty}" style="width:70px; min-width:70px; flex:0 0 auto; padding:5px;" oninput="updatePackagingLevel(${i},'qty',this.value)">
+                        <span style="font-size:12px; color:#666; white-space:nowrap;">${sotto}</span>
+                        <button type="button" class="btn btn-danger btn-sm" onclick="removePackagingLevel(${i})" title="Rimuovi livello">🗑️</button>
+                    </div>
+                `;
+            }
+            
+            c.innerHTML = html;
+            updatePackagingSummary();
+        }
+        
+        function updatePackagingSummary() {
+            const box = document.getElementById('prodPackagingSummary');
+            if (!box) return;
+            const d = derivePackaging(_prodPackaging);
+            if (!d) { box.innerHTML = ''; return; }
+            
+            const parts = [];
+            for (let i = 0; i < d.levels.length; i++) {
+                const sotto = (i === 0) ? 'pz' : (d.levels[i - 1].name || 'unità');
+                parts.push(`1 ${d.levels[i].name || '?'} = ${d.levels[i].qty} ${sotto}`);
+            }
+            
+            box.innerHTML = `
+                ${parts.join(' &nbsp;·&nbsp; ')}<br>
+                <strong>Unità di vendita:</strong> ${d.unitName} &nbsp;·&nbsp;
+                <strong>${d.pzPerPack.toLocaleString('it-IT')}</strong> pz per ${d.unitName} &nbsp;·&nbsp;
+                <strong>${d.packPerPallet.toLocaleString('it-IT')}</strong> ${d.unitName} per ${d.palletName} &nbsp;·&nbsp;
+                <strong>${d.piecesPerPallet.toLocaleString('it-IT')}</strong> pz per ${d.palletName}
+            `;
+            
+            // tiene allineato il campo pz_per_pack (calcolato, sola lettura)
+            const pzField = document.getElementById('newProdPzPack');
+            if (pzField) pzField.value = d.pzPerPack;
+        }
+        
+        // Carica l'imballo di un prodotto esistente nel form.
+        // Se il prodotto non ha imballo definito (prodotti "vecchi"), lo deduce
+        // dai valori che il sistema sta gia' usando per lui: nulla cambia.
+        function loadProdPackagingFrom(product) {
+            if (product && product.packaging && Array.isArray(product.packaging.levels) && product.packaging.levels.length) {
+                _prodPackaging = JSON.parse(JSON.stringify(product.packaging));
+            } else {
+                const pz = parseInt(product?.pz_per_pack) || 100;
+                const ppp = getPacksPerPallet(product?.descripcion || '', pz, null);
+                _prodPackaging = { levels: [{ name: 'Pack', qty: pz }, { name: 'Pallet', qty: ppp }], saleIdx: 0 };
+            }
+            renderProdPackaging();
+        }
+        
+        function collectProdPackaging() {
+            const levels = _prodPackaging.levels
+                .filter(l => (parseInt(l.qty) || 0) > 0)
+                .map(l => ({ name: (l.name || '').trim() || 'Livello', qty: parseInt(l.qty) || 1 }));
+            if (levels.length === 0) return null;
+            let saleIdx = _prodPackaging.saleIdx;
+            if (saleIdx > levels.length - 1) saleIdx = levels.length - 1;
+            return { levels: levels, saleIdx: saleIdx };
+        }
+        
         async function addProduct() {
             const code = document.getElementById('newProdCode').value.trim();
             const desc = document.getElementById('newProdDesc').value.trim();
             const quality = document.getElementById('newProdQuality').value.trim();
             const priceS = parseFloat(document.getElementById('newProdPriceS').value);
             const priceA = parseFloat(document.getElementById('newProdPriceA').value);
-            const pzPack = parseInt(document.getElementById('newProdPzPack').value) || 100;
+            // v48: l'imballo definisce pz_per_pack (non piu' digitato a mano)
+            const packaging = collectProdPackaging();
+            const derived = derivePackaging(packaging);
+            const pzPack = derived ? derived.pzPerPack : (parseInt(document.getElementById('newProdPzPack').value) || 100);
             const imgPreview = document.getElementById('newProdImgPreview');
             
             if (!code || !desc || isNaN(priceS) || isNaN(priceA)) {
@@ -3773,7 +4096,8 @@
                 qualita: quality,
                 precio_venta: priceS,
                 precio_compra: priceA,
-                pz_per_pack: pzPack
+                pz_per_pack: pzPack,
+                packaging: packaging // v48: imballo a livelli liberi
             };
             
             CAT[code] = productData;
@@ -3809,6 +4133,8 @@
             document.getElementById('newProdPriceS').value = '';
             document.getElementById('newProdPriceA').value = '';
             document.getElementById('newProdPzPack').value = '100';
+            _prodPackaging = defaultPackaging(); // v48
+            renderProdPackaging();
             document.getElementById('newProdImg').value = '';
             imgPreview.style.display = 'none';
             imgPreview.dataset.base64 = '';
@@ -3848,13 +4174,69 @@
         // CALCOLI PALLET/PACK/PEZZI
         // =====================================
         
-        function getPiecesPerPallet(desc) {
+        // v48: IMBALLO A LIVELLI LIBERI
+        // Ogni prodotto puo' avere un proprio "packaging":
+        //   { levels: [{name:'Pack', qty:100}, {name:'Pallet', qty:45}], saleIdx: 0 }
+        // - levels e' ordinato dal piu' piccolo al pallet
+        // - ogni livello dice QUANTI elementi del livello precedente contiene
+        //   (il primo livello conta i pezzi)
+        // - saleIdx e' l'indice del livello a cui e' riferito il prezzo di vendita
+        //   (-1 = il pezzo stesso, es. i fogli di cartone venduti a pezzo)
+        // Se un prodotto NON ha packaging, si usa la vecchia regola hardcoded:
+        // cosi' i prodotti gia' in uso continuano a funzionare identici.
+        function derivePackaging(pkg) {
+            if (!pkg || !Array.isArray(pkg.levels) || pkg.levels.length === 0) return null;
+            const lv = pkg.levels;
+            let s = (typeof pkg.saleIdx === 'number') ? pkg.saleIdx : 0;
+            if (s > lv.length - 1) s = lv.length - 1;
+            if (s < -1) s = -1;
+            let pz = 1;
+            for (let i = 0; i <= s; i++) pz *= (parseInt(lv[i]?.qty) || 1);
+            let ppp = 1;
+            for (let i = s + 1; i < lv.length; i++) ppp *= (parseInt(lv[i]?.qty) || 1);
+            return {
+                pzPerPack: pz,
+                packPerPallet: ppp,
+                piecesPerPallet: pz * ppp,
+                unitName: (s === -1) ? 'Pezzo' : (lv[s]?.name || 'Pack'),
+                palletName: lv[lv.length - 1]?.name || 'Pallet',
+                soldByPiece: (s === -1),
+                saleIdx: s,
+                levels: lv
+            };
+        }
+        
+        function getProductPackaging(code) {
+            const p = code ? CAT[code] : null;
+            return (p && p.packaging) ? derivePackaging(p.packaging) : null;
+        }
+        
+        // Nome dell'unita' di vendita del prodotto (Pack, Scatola, Pezzo...)
+        function getUnitName(code) {
+            const pk = getProductPackaging(code);
+            return pk ? pk.unitName : 'Pack';
+        }
+        
+        function getPalletName(code) {
+            const pk = getProductPackaging(code);
+            return pk ? pk.palletName : 'Pallet';
+        }
+        
+        function getPiecesPerPallet(desc, code) {
+            const pk = getProductPackaging(code);
+            if (pk) return pk.piecesPerPallet;
+            // legacy (prodotti senza imballo definito)
+            desc = desc || '';
             if (desc.includes('50x50') || desc.includes('50X50')) return 1900;
             if (desc.includes('40x40') || desc.includes('40X40')) return 3000;
             return 4500;
         }
         
-        function getPacksPerPallet(desc, pzPerPack) {
+        function getPacksPerPallet(desc, pzPerPack, code) {
+            const pk = getProductPackaging(code);
+            if (pk) return pk.packPerPallet;
+            // legacy (prodotti senza imballo definito)
+            desc = desc || '';
             if (desc.includes('50x50') || desc.includes('50X50')) return 38;
             if (desc.includes('40x40') || desc.includes('40X40')) return 60;
             return 45;
@@ -3875,8 +4257,8 @@
             }
             
             const product = CAT[code];
-            const pzPerPallet = getPiecesPerPallet(product.descripcion);
-            const pkPerPallet = getPacksPerPallet(product.descripcion, product.pz_per_pack);
+            const pzPerPallet = getPiecesPerPallet(product.descripcion, code);
+            const pkPerPallet = getPacksPerPallet(product.descripcion, product.pz_per_pack, code);
             
             let pallets;
             if (qtyType === 'pallet') {
@@ -3924,11 +4306,13 @@
             let totalPallets = 0, totalPacks = 0, totalPieces = 0, totalListino = 0, totalCostoFabbrica = 0;
             
             for (const item of currentOrder) {
-                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                 const packs = item.pallets * pkPerPallet;
                 const pieces = packs * item.pzPerPack;
                 const listino = packs * item.pricePerPack;
                 const costoFabbrica = pieces * item.costPerPiece;
+                const unitName = getUnitName(item.code);   // v48
+                const palletName = getPalletName(item.code); // v48
                 
                 totalPallets += item.pallets;
                 totalPacks += packs;
@@ -3944,12 +4328,12 @@
                         <div class="details">
                             <h4>${item.description}</h4>
                             <p>${item.refDimerca ? `DiMerca: ${item.refDimerca} | ` : ''}${item.code}</p>
-                            <p>${packs} pack × €${item.pricePerPack.toFixed(2)} = €${listino.toFixed(2)}</p>
+                            <p>${packs} ${unitName} × €${item.pricePerPack.toFixed(2)} = €${listino.toFixed(2)}</p>
                         </div>
                         <div class="qty">
                             <div class="num">${item.pallets}</div>
-                            <div class="unit">pallet</div>
-                            <div class="unit">(${packs} pk)</div>
+                            <div class="unit">${palletName.toLowerCase()}</div>
+                            <div class="unit">(${packs} ${unitName})</div>
                         </div>
                         <div class="actions">
                             <button class="btn btn-warning btn-sm" onclick="editQty('${item.code}')">✏️</button>
@@ -3994,20 +4378,25 @@
             const item = currentOrder.find(i => i.code === code);
             if (!item) return;
             
-            const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+            const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
             const currentPacks = item.pallets * pkPerPallet;
+            // v48: etichette su misura del prodotto
+            const _pk = getProductPackaging(item.code);
+            const _unit = getUnitName(item.code);
+            const _pallet = getPalletName(item.code);
+            let _opts = `<option value="pallet">${_pallet}</option>`;
+            if (!_pk || (!_pk.soldByPiece && _unit !== _pallet)) _opts += `<option value="pack">${_unit}</option>`;
+            _opts += '<option value="pezzi">Pezzi</option>';
             
             const modal = document.getElementById('editQtyModal');
             document.getElementById('editQtyContent').innerHTML = `
                 <p><strong>${item.description}</strong></p>
-                <p style="color: #666; margin-bottom: 15px;">Attualmente: ${item.pallets} pallet (${currentPacks} pack)</p>
+                <p style="color: #666; margin-bottom: 15px;">Attualmente: ${item.pallets} ${_pallet.toLowerCase()} (${currentPacks} ${_unit})</p>
                 <div class="grid-2">
                     <div class="form-group">
                         <label>Quantità per</label>
                         <select id="editQtyType">
-                            <option value="pallet">Pallet</option>
-                            <option value="pack">Pack</option>
-                            <option value="pezzi">Pezzi</option>
+                            ${_opts}
                         </select>
                     </div>
                     <div class="form-group">
@@ -4035,8 +4424,8 @@
                 return;
             }
             
-            const pzPerPallet = getPiecesPerPallet(item.description);
-            const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+            const pzPerPallet = getPiecesPerPallet(item.description, item.code);
+            const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
             
             if (qtyType === 'pallet') {
                 item.pallets = qtyValue;
@@ -4088,7 +4477,7 @@
             
             let totalPacks = 0, totalPieces = 0, totalListino = 0, totalCost = 0;
             for (const item of currentOrder) {
-                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                 const packs = item.pallets * pkPerPallet;
                 const pieces = packs * item.pzPerPack;
                 totalPacks += packs;
@@ -4465,7 +4854,7 @@
             // Se diretto al cliente: includi anche il prezzo di vendita (item.pricePerPack)
             const newCaricoItems = [];
             for (const item of order.items) {
-                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                 const packs = item.pallets * pkPerPallet;
                 const newItem = {
                     code: item.code,
@@ -4623,11 +5012,17 @@
             let totalPacks = 0, totalPieces = 0;
             
             for (const item of items) {
-                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack);
+                const pkPerPallet = getPacksPerPallet(item.description, item.pzPerPack, item.code);
                 const packs = item.pallets * pkPerPallet;
                 const pieces = packs * item.pzPerPack;
                 
-                totalPacks += packs;
+                // v48: unita' di vendita propria del prodotto
+                const unitName = getUnitName(item.code);
+                const soldByPiece = getProductPackaging(item.code)?.soldByPiece;
+                
+                // i prodotti venduti a pezzo (es. cardboard) non hanno pack:
+                // non vanno sommati nel totale pack, sarebbe un numero senza senso
+                if (!soldByPiece) totalPacks += packs;
                 totalPieces += pieces;
                 
                 tableData.push([
@@ -4636,14 +5031,14 @@
                     item.description,
                     item.qualita || '-',
                     item.pallets.toString(),
-                    packs.toString(),
+                    soldByPiece ? '-' : (unitName === 'Pack' ? packs.toString() : `${packs} ${unitName}`),
                     pieces.toLocaleString('it-IT')
                 ]);
             }
             
             doc.autoTable({
                 startY: y,
-                head: [['IMG', 'Code', 'Description', 'Quality', 'Pallet', 'Pack', 'Pieces']],
+                head: [['IMG', 'Code', 'Description', 'Quality', 'Pallet', 'Units', 'Pieces']],
                 body: tableData,
                 theme: 'striped',
                 headStyles: { fillColor: [220, 20, 60], textColor: 255 },
@@ -4651,9 +5046,9 @@
                     0: { cellWidth: 20 },
                     1: { cellWidth: 30 },
                     2: { cellWidth: 50 },
-                    3: { cellWidth: 35 },
+                    3: { cellWidth: 28 },
                     4: { cellWidth: 15, halign: 'center' },
-                    5: { cellWidth: 15, halign: 'center' },
+                    5: { cellWidth: 22, halign: 'center' },
                     6: { cellWidth: 22, halign: 'right' }
                 },
                 didDrawCell: function(data) {
@@ -4676,7 +5071,7 @@
             
             doc.setTextColor(0, 0, 0);
             doc.setFontSize(10);
-            doc.text('Total Packs:', pageWidth - 75, finalY + 8);
+            doc.text('Total Units:', pageWidth - 75, finalY + 8);
             doc.text('Total Pieces:', pageWidth - 75, finalY + 16);
             
             doc.setFont('helvetica', 'bold');
@@ -6174,6 +6569,7 @@
                             ` : ''}
                         </div>
                         <div class="mov-actions" style="display: flex; gap: 5px; margin-left: 10px;">
+                            <button class="btn btn-secondary btn-sm" onclick="editMovementNote('${m.id}')" title="Modifica solo la nota">📝</button>
                             <button class="btn btn-warning btn-sm" onclick="editMovement('${m.id}')" title="Modifica">✏️</button>
                             <button class="btn btn-danger btn-sm" onclick="deleteMovement('${m.id}')" title="Elimina">🗑️</button>
                         </div>
@@ -6637,6 +7033,9 @@
                 // Precompila i dati
                 document.getElementById('caricoDate').value = mov.date;
                 document.getElementById('caricoNote').value = mov.note || '';
+                // v48 fix: ripristina anche il lotto, altrimenti si perdeva a ogni modifica
+                const _lottoField = document.getElementById('caricoLotto');
+                if (_lottoField) _lottoField.value = mov.lotto || '';
                 
                 // Se era un carico diretto
                 if (mov.isDiretto) {
@@ -6694,6 +7093,74 @@
             }
             
             renderStock();
+        }
+        
+        // v48: modifica SOLO la nota (e il lotto) di un movimento.
+        // Non tocca stock, lotti FIFO ne' quantita': e' una modifica di testo.
+        function editMovementNote(movId) {
+            const mov = MOVEMENTS.find(m => m.id === movId);
+            if (!mov) { alert('Movimento non trovato'); return; }
+            
+            const isCaricoMagazzino = (mov.type === 'carico' && !mov.isDiretto);
+            const titolo = mov.type === 'carico' ? 'Carico' : (mov.type === 'scarico' ? 'Consegna' : 'Allineamento');
+            
+            let html = `
+                <p style="color:#666; margin-bottom:12px;">
+                    ${titolo} del ${new Date(mov.date).toLocaleDateString('it-IT')} —
+                    quantità e giacenze non vengono toccate.
+                </p>
+                <div class="form-group">
+                    <label>Nota</label>
+                    <textarea id="editMovNoteText" rows="3" style="width:100%;">${(mov.note || '').replace(/</g, '&lt;')}</textarea>
+                </div>
+            `;
+            
+            if (isCaricoMagazzino) {
+                html += `
+                    <div class="form-group">
+                        <label>Lotto</label>
+                        <input type="text" id="editMovLottoText" value="${(mov.lotto || '').replace(/"/g, '&quot;')}" placeholder="Opzionale — appare nei lotti FIFO">
+                    </div>
+                `;
+            }
+            
+            html += `
+                <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:15px;">
+                    <button class="btn btn-secondary" onclick="closeModal('editMovementModal')">Annulla</button>
+                    <button class="btn btn-success" onclick="saveMovementNote('${movId}')">💾 Salva</button>
+                </div>
+            `;
+            
+            document.getElementById('editMovementContent').innerHTML = html;
+            document.getElementById('editMovementModal').classList.add('active');
+        }
+        
+        async function saveMovementNote(movId) {
+            const mov = MOVEMENTS.find(m => m.id === movId);
+            if (!mov) { alert('Movimento non trovato'); return; }
+            
+            mov.note = document.getElementById('editMovNoteText').value.trim();
+            
+            const lottoField = document.getElementById('editMovLottoText');
+            if (lottoField) {
+                const nuovoLotto = lottoField.value.trim();
+                mov.lotto = nuovoLotto;
+                // allinea l'etichetta lotto anche nei lotti FIFO generati da questo carico
+                for (const code of Object.keys(FIFO_STOCK || {})) {
+                    for (const l of (FIFO_STOCK[code] || [])) {
+                        if (l.movId === movId) l.lotto = nuovoLotto;
+                    }
+                }
+            }
+            
+            mov.updatedAt = new Date().toISOString();
+            dataModified = true;
+            
+            closeModal('editMovementModal');
+            await syncWarehouseToCloud();
+            renderMovements();
+            refreshFifoIfVisible();
+            updateStatus();
         }
         
         function showMagSubpanelDirect(name) {
@@ -6806,6 +7273,7 @@
                     costo: costoTotale
                 },
                 note: note || 'Carico container',
+                lotto: lotto, // v48 fix: il lotto veniva perso in modifica
                 updatedAt: new Date().toISOString()
             };
             
@@ -8138,6 +8606,10 @@
                         };
                         
                         if (CAT[id]) {
+                            // v48: se il prodotto ha un imballo definito, pz_per_pack resta
+                            // quello derivato dall'imballo (l'Excel non lo puo' sfasare)
+                            const _der = CAT[id].packaging ? derivePackaging(CAT[id].packaging) : null;
+                            if (_der) productData.pz_per_pack = _der.pzPerPack;
                             // Aggiorna prodotto esistente (mantieni eventuali altri campi, es. clientRefs)
                             CAT[id] = { ...CAT[id], ...productData };
                             updated++;
